@@ -1,8 +1,6 @@
-"""Sparse Betti matching: a topological loss for image segmentation computed on a
-sparse cubical complex.
+"""sparseBM: Betti matching on sparse cubical complexes.
 
-The compiled matcher (``betti_matching``, built from ``cpp/``) must be importable,
-e.g. by adding its build directory to ``PYTHONPATH``.
+Requires the compiled ``betti_matching`` module from ``cpp/`` on the ``PYTHONPATH``.
 """
 
 from .loss import (SparseBettiLoss, SparseBettiLossBatched, clamp_for_matching,

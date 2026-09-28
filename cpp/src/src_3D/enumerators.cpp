@@ -18,7 +18,6 @@ void BoundaryEnumerator::setBoundaryEnumerator(const Cube &_cube) {
     position = 0;
     if (cone != nullptr && isVirtualCell(_cube.index)) {
         if (cone->hasCycles()) {
-            // Resolve the column's cone2Cell slot ONCE, not per face.
             const uint8_t code = _cube.type() - VIRTUAL_TYPE_BASE;
             const uint8_t anchorType = code / 4;
             const uint8_t rank = code % 4;
@@ -34,37 +33,14 @@ void BoundaryEnumerator::setBoundaryEnumerator(const Cube &_cube) {
     }
 }
 
-// Boundary of a virtual (cone) 2-cell, in DECREASING order.
-//
-// With explicit fundamental cycles (cone_prune=true) it is the stored cycle --
-// real kept edges only, variable length -- and `slot` indexes it directly,
-// because the CSR is written in decreasing Cube-index order. Index order,
-// which is complex-independent, is enough: every consumer but one pushes into
-// a priority queue, and the one exception, `isEmergentPair`, looks only at
-// faces whose birth EQUALS the column's, of which a cycle column has none --
-// its faces are real kept edges, at most CONE_BIRTH. A face AT CONE_BIRTH (a
-// kept edge at the background value) can tie with the column, and then the
-// check fires and produces a zero-persistence (CONE_BIRTH, CONE_BIRTH) pair,
-// which is dropped -- a cycle born at background dying at background, exactly
-// as in the dense filtration.
-// (birth, index) order is not needed and would differ between cgc0, cgc1 and
-// cgcComp.
-//
-// Without them (cone_prune=false) the boundary is the 3-face
-// cone2Cell(p, e) = e + coneEdge(p, v0) + coneEdge(p, v1).
-// `slot` counts down the DECREASING (birth, index) order that the emergent-pair
-// lemma relies on: both cone edges are born at CONE_BIRTH, at or above the
-// anchor edge, and at equal birth their virtual type (>= 3) outranks the
-// anchor's; coneEdge(p,v1) outranks coneEdge(p,v0) because v1 = v0 + e_axis
-// sorts higher. So the order is always v1, v0, e.
+// Faces of a cone 2-cell in decreasing order, as the emergent pair check
+// expects. With pruning, the face list is the stored fundamental cycle.
+// Otherwise the boundary is coneEdge(p, v1), coneEdge(p, v0), e.
 bool BoundaryEnumerator::virtualFace(uint32_t slot) {
     if (slot >= coneFaces) {
         return false;
     }
     if (coneSlot >= 0) {
-        // Explicit fundamental cycle: real kept edges only, already stored in
-        // DECREASING Cube-index order, so `slot` counts down the order the
-        // emergent-pair lemma needs (see the comment above virtualFace).
         const uint64_t k = cone->cycleEdge(coneSlot, static_cast<int32_t>(slot));
         const index_t ex = (k >> 44) & 0xfffff;
         const index_t ey = (k >> 24) & 0xfffff;
@@ -93,11 +69,6 @@ bool BoundaryEnumerator::virtualFace(uint32_t slot) {
     } else {
         vRank = cone->rankAtV0(e, rank);
     }
-    // V-construction rule with the apex treated as a virtual voxel at
-    // CONE_BIRTH: a cone edge's birth is max(CONE_BIRTH, its real vertex).
-    // BettiMatching has checked no kept voxel exceeds CONE_BIRTH, so that is
-    // CONE_BIRTH -- identical in cgc0, cgc1 and cgcComp, which is what the
-    // shared virtual slice needs.
     nextFace = Cube(pocketBirth, v[0], v[1], v[2],
                     VIRTUAL_TYPE_BASE + vRank);
     return true;
@@ -194,7 +165,6 @@ bool BoundaryEnumerator::hasPreviousFace() {
 
 bool BoundaryEnumerator::hasNextFace() {
     if (cone != nullptr && isVirtualCell(cube.index)) {
-        // The reverse of hasPreviousFace's order.
         if (position >= coneFaces) {
             return false;
         }

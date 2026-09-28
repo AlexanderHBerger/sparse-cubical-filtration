@@ -32,12 +32,6 @@ Dimension1::Dimension1(const CubicalGridComplex &_cgc0,
       uf0(UnionFindDual(cgc0, _kept, _pockets, CONE_BIRTH)),
       uf1(UnionFindDual(cgc1, _kept, _pockets, CONE_BIRTH)),
       ufComp(UnionFindDual(cgcComp, _kept, _pockets, CONE_BIRTH)) {
-    // Pockets are born at CONE_BIRTH in ALL THREE complexes: the masked region
-    // is the last thing to enter every one of them -- at or above every kept
-    // cell (checked in BettiMatching), and elder to every kept top cell at a
-    // tie by link()'s original-index rule. In 2D dim 1 IS the top
-    // dimension, so this dual union-find is the whole of the sparse
-    // construction -- there are no cone 2-cells to add.
     uf0.seedPockets();
     uf1.seedPockets();
     ufComp.seedPockets();
@@ -85,10 +79,6 @@ void Dimension1::enumerateDualEdges(vector<Cube> &dualEdges,
                              : cgc.getNumberOfCubes(1));
     value_t birth;
     if (sparse) {
-        // Only kept edges can pass the birth filter (shared mask), so
-        // iterate the kept list -- its canonical (x,y,type) order equals the
-        // full-grid visit order restricted to kept cells (and the sort's
-        // (birth, index) order is total, so the result is identical).
         for (const uint64_t key : kept->keptEdges) {
             const index_t x = (key >> 34) & 0xfffff;
             const index_t y = (key >> 4) & 0xfffff;
@@ -142,7 +132,6 @@ void Dimension1::computeInputAndImagePairs(vector<Cube> &dualEdges,
     dim2::Coordinate birthCoordinates;
     for (auto edge = dualEdges.rbegin(), last = dualEdges.rend(); edge != last;
          ++edge) {
-        // Sparse: masked top cells resolve to their pocket's virtual node.
         boundaryIndices = uf.getBoundaryIndices(*edge);
         parentIdx0 = uf.find(boundaryIndices[0]);
         parentIdx1 = uf.find(boundaryIndices[1]);
@@ -154,16 +143,8 @@ void Dimension1::computeInputAndImagePairs(vector<Cube> &dualEdges,
             birthIdxComp = ufComp.link(parentIdx0, parentIdx1);
             if (edge->birth != birth) {
                 if (uf.isPocketNode(birthIdx)) {
-                    // CENSORED: the dying root is a virtual pocket, so the
-                    // death is CONE_BIRTH and there is no death voxel. A
-                    // pocket is elder to every kept top cell (at or above it,
-                    // and the original-index tie-break lets the cube die), so
-                    // this fires only for pocket-vs-pocket and
-                    // pocket-vs-sentinel merges -- exactly the genuine cavity
-                    // deaths. Record the BIRTH cell; the loss's essential head
-                    // already means "death censored, gradient on the birth
-                    // voxel only", for every birth value (see
-                    // src_3D/dimension_2.cpp).
+                    // The dying root is a pocket: the class is censored at
+                    // CONE_BIRTH and stored by its birth cell.
                     essentials.push_back(*edge);
                     censoredMatchMap.emplace(birthIdxComp,
                                              essentials.size() - 1);
@@ -188,11 +169,6 @@ void Dimension1::computeInputAndImagePairs(vector<Cube> &dualEdges,
     dualEdges.erase(new_end, dualEdges.end());
 #endif
 
-    // Sparse: every kept top cell has all four of its dual edges kept (a kept
-    // top cell's faces are kept), so the dual graph reaches a pocket or the
-    // exterior from everywhere and NOTHING survives -- every top-dim class
-    // dies by CONE_BIRTH, because the box is acyclic. The scan over the kept
-    // top cells (compact ids 0..K-1) is a safety net only.
     if (config.sparseComplex) {
         const index_t numTopCells =
             static_cast<index_t>(kept->keptTopCells.size());
@@ -203,7 +179,6 @@ void Dimension1::computeInputAndImagePairs(vector<Cube> &dualEdges,
                 value_t rootBirth = uf.getBirth(idx);
                 if (rootBirth != INFTY &&
                     rootBirth < config.maskThreshold) {
-                    // Comp-root keyed (see src_3D/dimension_2.cpp).
                     if (rootBirth < TAU_REAL) {
                         essentialMatchMap.emplace(ufComp.find(idx),
                                                   essentials.size());
@@ -245,22 +220,12 @@ void Dimension1::computeCompPairsAndMatch(vector<Cube> &dualEdges) {
             birth = ufComp.getBirth(birthIdx);
             if (edge->birth != birth) {
                 if (ufComp.isPocketNode(birthIdx)) {
-                    // Censored on the comparison side too: join the two input
-                    // sides' censored records under the same comparison root,
-                    // exactly as the finite path joins through matchMap0/1.
-                    // A mixed case (censored on one side, finite on the other)
-                    // cannot arise: a pocket sits at CONE_BIRTH, above every
-                    // kept top cell, so it only ever dies against another
-                    // pocket or the sentinel, in every one of the three UFs.
                     auto c0 = censoredMatchMap0.find(birthIdx);
                     auto c1 = censoredMatchMap1.find(birthIdx);
                     if (c0 != censoredMatchMap0.end() &&
                         c1 != censoredMatchMap1.end()) {
                         essentialMatches.push_back({c0->second, c1->second});
                     }
-                    // NB: fall through to the clearing below -- the merge DID
-                    // happen, so this edge is negative in dim 1 and must still
-                    // be cleared from the worklist handed to dim 0.
                 } else {
 #ifdef COMPUTE_COMPARISON
                     auto birthCoordinates = ufComp.getCoordinates(birthIdx);
@@ -292,8 +257,6 @@ void Dimension1::computeCompPairsAndMatch(vector<Cube> &dualEdges) {
     dualEdges.erase(new_end, dualEdges.end());
 #endif
 
-    // Essential pass (top dimension, see src_3D/dimension_2.cpp); a safety
-    // net only, nothing survives in sparse mode.
     if (config.sparseComplex) {
         const index_t numTopCells =
             static_cast<index_t>(kept->keptTopCells.size());

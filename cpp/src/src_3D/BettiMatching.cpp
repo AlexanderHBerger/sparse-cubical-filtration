@@ -22,11 +22,6 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
     : cgc0(input0, shape), cgc1(input1, shape), cgcComp(comparison, shape),
       config(_config) {
     if (config.sparseComplex) {
-        // One O(N) classification pass over the comparison complex; all
-        // sparse-mode structures (compact union-finds, K-sized cube maps,
-        // kept-cell enumerations) index through it. Masked voxels are INFTY
-        // in both inputs (shared mask), so this single kept set serves all
-        // three complexes and both image complexes.
         keptCells = std::make_unique<KeptCells>(cgcComp);
         if (config.pocketLabels == nullptr) {
             throw runtime_error("sparse=True requires pocket_labels");
@@ -34,14 +29,6 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
         pocketNodes = std::make_unique<PocketNodes>(
             cgcComp, *config.pocketLabels,
             keptCells->keptVertices.size());
-        // The one precondition the whole construction rests on: every
-        // virtual cell is born at CONE_BIRTH, the background value, and
-        // no real cell of the kept complex may lie above it (equal is
-        // fine: kept cells are ordered before virtual ones at equal
-        // value, see config.h). A cell's V-construction value is the max
-        // over its corner voxels, so checking the kept VOXELS covers every
-        // kept cell of every dimension in all three complexes. O(K), kept
-        // voxels only.
 #ifdef RUNTIME
         auto _tcl = std::chrono::high_resolution_clock::now();
 #endif
@@ -52,11 +39,8 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
             if (cgc0.getBirth(x, y, z) > CONE_BIRTH ||
                 cgc1.getBirth(x, y, z) > CONE_BIRTH) {
                 throw runtime_error(
-                    "sparse=True requires every kept "
-                    "voxel to be at most CONE_BIRTH (1.0), the background "
-                    "value the virtual pocket cells carry; found one "
-                    "above it. Inputs are expected in the fg-low [0, 1] "
-                    "convention.");
+                    "sparse=True requires all kept values to be at most "
+                    "1.0 (inputs are g = 1 - p in [0, 1])");
             }
         }
 #ifdef RUNTIME
@@ -100,14 +84,9 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
 #endif
 }
 
-// Move every container member: a member-wise copy would deep-copy the dense
-// dim-1 caches on every construction through the dimension-dispatch variant.
 BettiMatching::BettiMatching(BettiMatching &&other)
     : cgc0(std::move(other.cgc0)), cgc1(std::move(other.cgc1)),
       cgcComp(std::move(other.cgcComp)), config(other.config),
-      // Moving the unique_ptr keeps the KeptCells object at the same
-      // address, so the kept pointers stored inside the retained dim-1
-      // caches stay valid across the move.
       keptCells(std::move(other.keptCells)),
       pocketNodes(std::move(other.pocketNodes)),
       coneIndex(std::move(other.coneIndex)),
@@ -169,9 +148,6 @@ void BettiMatching::computeMatching() {
         auto start = high_resolution_clock::now();
 #endif
 
-        // The reduction caches are working state of Dimension1 --
-        // allocate them here, right before use, not in the ctor. In
-        // sparse mode they are K-sized compact maps over the kept 2-cells.
         dim1CacheInputPairs0.emplace(cgc0.shape, keptCells.get(), coneIndex.get());
         dim1CacheInputPairs1.emplace(cgc0.shape, keptCells.get(), coneIndex.get());
         dim1CacheCompPairs.emplace(cgc0.shape, keptCells.get(), coneIndex.get());
@@ -210,8 +186,6 @@ void BettiMatching::computeMatching() {
     }
 
 #ifdef USE_CACHE
-    // The caches are only needed again by computeRepresentativeCycles;
-    // release them early when the caller opts out of that.
     if (config.releaseCachesAfterMatching) {
         dim1CacheInputPairs0.reset();
         dim1CacheInputPairs1.reset();
@@ -242,20 +216,12 @@ void BettiMatching::computeVoxels() {
             }
         }
         for (auto &match : matches[d]) {
-            // Both deaths are real cells: a censored class is matched to a
-            // censored class and lives in essentialMatches (a mixed join
-            // throws in Dimension1::computeMatching). getParentVoxel throws
-            // on a virtual cell, so this also guards the invariant.
             _matched[d].push_back(VoxelMatch(
                 VoxelPair(cgc0.getParentVoxel(match.pair0.birth, d),
                           cgc0.getParentVoxel(match.pair0.death, d + 1)),
                 VoxelPair(cgc1.getParentVoxel(match.pair1.birth, d),
                           cgc1.getParentVoxel(match.pair1.death, d + 1))));
         }
-        // Comparison pair per match, row-aligned with `matched`.
-        // isMatchedWithIndexComp maps comp-pair birth index to
-        // the match index in every dimension. (VoxelPair is not assignable,
-        // hence the pointer indirection.)
         vector<const Pair *> compByMatch(matches[d].size(), nullptr);
         for (auto &pair : pairsComp[d]) {
             auto find = isMatchedWithIndexComp[d].find(pair.birth.index);
@@ -269,18 +235,11 @@ void BettiMatching::computeVoxels() {
                     "match without a comparison pair in dimension " +
                     std::to_string(d));
             }
-            // A finite match has a real comparison death too: a censored
-            // comparison death joins two censored input bars and never
-            // reaches `matches` (getParentVoxel throws on a virtual cell).
             _matchedComp[d].push_back(VoxelPair(
                 cgcComp.getParentVoxel(compPair->birth, d),
                 cgcComp.getParentVoxel(compPair->death, d + 1)));
         }
 
-        // Sparse essentials (censored bars): every record is represented by
-        // its BIRTH cell, a d-cell. Matched classes surface in the row-aligned
-        // matched lists; unmatched surfacing applies the per-side TAU_REAL
-        // gate so background classes never reach the loss.
         const uint8_t cellDim = d;
         vector<bool> matched0(essentials0[d].size(), false);
         vector<bool> matched1(essentials1[d].size(), false);
@@ -322,10 +281,6 @@ vector<vector<VoxelPair>> BettiMatching::computePairsInput0() {
                     essentialMatches[2], keptCells.get(), pocketNodes.get());
     dim2.computeInput0Pairs(ctr0);
 
-    // The input-0 barcode reduction only ever touches the input-0
-    // cache; give the other two minimal 1-voxel backing instead of two
-    // full-size dense maps. The input-0 cache is K-sized in sparse
-    // mode; the two untouched ones keep the dense 1-voxel backing.
     dim1CacheInputPairs0.emplace(cgc0.shape, keptCells.get(), coneIndex.get());
     dim1CacheInputPairs1.emplace(vector<index_t>{1, 1, 1});
     dim1CacheCompPairs.emplace(vector<index_t>{1, 1, 1});

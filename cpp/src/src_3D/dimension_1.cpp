@@ -12,22 +12,9 @@
 using namespace dim3;
 using namespace std::chrono;
 
-// Can `ctrImage = ctrComp` be taken BEFORE the comparison reduction instead of
-// after it? If so, the image reductions no longer have to wait for the
-// comparison one and all five dim-1 reductions start together -- which matters a
-// lot, because they are heavily unbalanced (see computePairsAndMatch).
-//
-// It is safe exactly when nothing the image passes need is produced by the
-// comparison pass:
-//   USE_CLEARING_IMAGE      -- computePairsComp() then ERASES entries from
-//                             ctrComp, so the copy must be taken afterwards.
-//   USE_APPARENT_PAIRS_COMP -- ctrImage is built in Dimension2, not copied here.
-//   USE_ISPAIRED            -- the image passes read isPairedComp[], which the
-//                             comparison pass writes.
-// None of the three is enabled by default. Without USE_CLEARING_DIM0 the image
-// passes read ctrComp directly and there was never a barrier.
-// Build with -DNO_DIM1_CTRIMAGE_HOIST to run the comparison reduction before
-// the image reductions (for timing comparisons only).
+// Copying ctrComp into ctrImage before the comparison reduction lets all five
+// reductions run in parallel. This is only valid as long as the comparison
+// reduction does not modify ctrComp.
 #if defined(USE_CLEARING_DIM0) and not defined(USE_APPARENT_PAIRS_COMP) and    \
     not defined(USE_CLEARING_IMAGE) and not defined(USE_ISPAIRED) and          \
     not defined(NO_DIM1_CTRIMAGE_HOIST)
@@ -77,8 +64,6 @@ Dimension1::Dimension1(const CubicalGridComplex &_cgc0,
 #endif
 {
     if (cone != nullptr) {
-        // Cone-edge keys are resolved through the dense vertex id space
-        // (x*n_yz + y*n_z + z), so every edge-keyed map needs its strides.
         const size_t sy = static_cast<size_t>(_cgc0.shape[1]);
         const size_t sz = static_cast<size_t>(_cgc0.shape[2]);
         for (SparseOrDenseCubeMap<1, size_t> *m :
@@ -99,12 +84,10 @@ void Dimension1::computePairsAndMatch(vector<Cube> &ctr0, vector<Cube> &ctr1,
     defined(USE_CLEARING_IMAGE)
     if (config.sparseComplex) {
         throw runtime_error(
-            "sparse-complex dimension 1 is unaudited with USE_APPARENT_PAIRS, "
+            "sparse=True is not supported with USE_APPARENT_PAIRS, "
             "USE_APPARENT_PAIRS_COMP or USE_CLEARING_IMAGE");
     }
 #endif
-    // Sparse mode: append the cone columns once, BEFORE the parallel section
-    // below (the three column lists are independent afterwards).
     if (cone != nullptr) {
         appendConeColumns(ctr0, cgc0);
         appendConeColumns(ctr1, cgc1);
@@ -132,14 +115,6 @@ void Dimension1::computePairsAndMatch(vector<Cube> &ctr0, vector<Cube> &ctr1,
 #endif
     };
 
-// The image worklist is a copy of the comparison columns. Hoisting that copy out
-// of processComparison is what lets the image reductions start immediately
-// instead of waiting for the comparison reduction (see the scheduling note
-// below). It is value-identical ONLY because computePairsComp() does not mutate
-// ctrComp: its single write site is the USE_CLEARING_IMAGE clearing pass. With
-// that flag on, the copy must stay after the reduction and the barrier stays.
-// The copy must in any case precede enumerateEdges(), which REPLACES ctrComp's
-// 2-cells with dimension 0's edge worklist.
 #ifdef DIM1_CTRIMAGE_HOISTED
     ctrImage = ctrComp;
 #endif
@@ -196,24 +171,6 @@ void Dimension1::computePairsAndMatch(vector<Cube> &ctr0, vector<Cube> &ctr1,
     };
 
 #ifdef PARALLELIZE_INDEPENDENT_BARCODES_DIM1
-    // SCHEDULING. The five reductions are independent -- they write disjoint
-    // state (pairs/matchMap per side, pivotColumnIndex per pass) and are joined
-    // only by computeMatching() below. The one real dependency was
-    // `ctrImage = ctrComp`, and hoisting that copy above removes it, so all five
-    // can now start at once.
-    //
-    // This matters because the reductions are heavily UNBALANCED (image 0
-    // alone can be a large share of dim-1's work). With a
-    // comparison-then-images barrier the critical path would be
-    // comparison + image0; without it, it is max(...) = image0.
-    //
-    // USE_APPARENT_PAIRS_COMP still needs the barrier (it builds ctrImage inside
-    // Dimension2/the comparison pass), and USE_ISPAIRED reads isPairedComp,
-    // which the comparison pass writes. Both are compiled out by default.
-    // NB: every future below is consumed with get(), not wait(). wait() blocks
-    // but does NOT rethrow, and neither does std::future's destructor, so an
-    // exception inside any of the five reductions would vanish silently and
-    // the caller would receive a quietly truncated result.
     auto comparisonFuture = std::async(processComparison);
     auto input0Future = std::async(processInput0);
     auto input1Future = std::async(processInput1);
@@ -275,10 +232,6 @@ void Dimension1::computePairsComp(vector<Cube> &ctr) {
 
 void Dimension1::computePairsImage(vector<Cube> &ctr, uint8_t k) {
 #ifdef USE_CACHE
-    // The transient per-image cache is K-sized in sparse mode too.
-    // Sparse mode: it must ALSO know about the cone, because the image
-    // reductions cache cone 2-cell columns like any other (without it, every
-    // write of a virtual key would throw).
     SparseOrDenseCubeMap<2, vector<Cube>> cache(cgc0.shape, kept, cone);
 #endif
     computePairsUnified<ComputePairsMode::IMAGE_PAIRS>(ctr, k
@@ -294,10 +247,8 @@ void Dimension1::appendConeColumns(vector<Cube> &ctr,
     if (cone == nullptr) {
         return;
     }
-    // One column per (rim edge, pocket). With cycles built (pruning on)
-    // only the NON-TREE slots are emitted, each carrying its explicit
-    // fundamental cycle; the forest columns pair with cone edges at their own
-    // birth and emit nothing, so they are not built at all.
+    // Appended after all real columns: at equal value, every kept cell comes
+    // before the cone.
     const bool cycles = cone->hasCycles();
     const size_t first = ctr.size();
     for (size_t i = 0; i < kept->keptEdges.size(); ++i) {
@@ -312,30 +263,15 @@ void Dimension1::appendConeColumns(vector<Cube> &ctr,
         const uint8_t type = key & 0xf;
         const int32_t base = cone->cone2CellSlot(static_cast<int32_t>(i), 0);
         for (uint8_t r = 0; r < count; ++r) {
-            // Suppressed columns are simply not emitted; their SLOT still
-            // exists, so every map sizing and every cone2CellSlot() stays
-            // valid and the (birth, index) tie-break inside the virtual slice
-            // is unperturbed.
             const int32_t slot = base + r;
             if (cycles ? !cone->emitCycleColumn(slot)
                        : !cone->emitCone2Cell(slot)) {
                 continue;
             }
-            // The V rule is the max over the column's faces; those are real
-            // kept edges (with cycles) or the anchor edge plus two cone edges,
-            // and a cone edge is born at CONE_BIRTH. BettiMatching has checked
-            // that no kept cell exceeds CONE_BIRTH, so that max is CONE_BIRTH
-            // unconditionally -- the same value in cgc0, cgc1 and cgcComp,
-            // which is exactly what the shared virtual slice needs.
             ctr.push_back(Cube(CONE_BIRTH, x, y, z,
                                VIRTUAL_TYPE_BASE + 4 * type + r));
         }
     }
-    // The cone block is APPENDED, not merged: at equal value, kept cells come
-    // before virtual ones (config.h). Every real column is at most CONE_BIRTH,
-    // so this is the (birth, kept-before-virtual, index) order, and "all of K
-    // precedes the cone" holds in the total order even for real columns that
-    // sit exactly at the background value. The block itself sorts by index.
     sort(ctr.begin() + first, ctr.end(), CubeComparator());
 }
 
@@ -355,29 +291,13 @@ void Dimension1::computeMatching() {
             auto find0 = matchMap0.find(birthIndex0);
             auto find1 = matchMap1.find(birthIndex1);
             if (find0.has_value() && find1.has_value()) {
-                // A censored comparison death (a cone column) joins two
-                // CENSORED input bars, never a finite one, and a real
-                // comparison death joins two FINITE ones. The censored
-                // classes are H_1(K) -- the same space on all three sides,
-                // since the three filtrations live on the same complex K and
-                // all of K precedes the cone in every column order -- and the
-                // image reductions reduce the same real columns as the
-                // inputs' own reductions under the same row order, so the set
-                // of rows the real block claims is identical: an edge killed
-                // by a REAL column in an input's own reduction is claimed by
-                // a real column in the image reduction too, and no cone
-                // column can pivot on it. A "mixed" join therefore means the
-                // three reductions disagree about which classes die at the
-                // cone, which would be a bug in an earlier stage (e.g. an
-                // unseeded comparison dual sweep), so it throws rather than
-                // being routed.
                 const bool censored0 =
                     cone != nullptr && isVirtualCell(find0->death.index);
                 const bool censored1 =
                     cone != nullptr && isVirtualCell(find1->death.index);
                 if (censored0 != censored1) {
                     throw runtime_error(
-                        "pocket-cone dim-1 matching: a class is censored on "
+                        "sparse dim-1 matching: a class is censored on "
                         "one input side and finite on the other; the three "
                         "reductions disagree on which classes die at the "
                         "cone");
@@ -430,9 +350,6 @@ void Dimension1::enumerateEdges(
     bool binaryInputs = true;
 #endif
     if (sparse) {
-        // Only kept edges can pass the birth filter (shared mask), so
-        // iterate the kept list -- its canonical (x,y,z,type) order equals
-        // the full-grid visit order restricted to kept edges.
         for (const uint64_t key : kept->keptEdges) {
             const index_t x = (key >> 44) & 0xfffff;
             const index_t y = (key >> 24) & 0xfffff;
@@ -635,14 +552,10 @@ bool Dimension1::isEmergentPair(
     BoundaryEnumerator &enumerator, BoundaryEnumerator &enumeratorAP,
     CoboundaryEnumerator &coEnumeratorAP,
     SparseOrDenseCubeMap<1, size_t> &pivotColumnIndex) const {
-    // The image reduction is the ONLY one that re-derives a column's birth from
-    // the grid (the other three use column.birth directly). A virtual cone
-    // 2-cell has no grid birth: it is born at CONE_BIRTH in every complex
-    // (getBirth throws on a virtual cell).
     auto birth = column.birth;
     if (computePairsMode == IMAGE_PAIRS) {
         if (cone != nullptr && isVirtualCell(column.index)) {
-            birth = CONE_BIRTH;      // see appendConeColumns
+            birth = CONE_BIRTH;
         } else {
             birth = cgc.getBirth(column.x(), column.y(), column.z(),
                                  column.type(), 2);
@@ -842,26 +755,19 @@ void Dimension1::computePairsUnified(vector<Cube> &ctr, uint8_t k
 #endif
 #endif
 #ifdef RUNTIME
-    // Column-outcome census: does a column end on a PIVOT (a dim-1 pair) or at
-    // ZERO (it bounds), and how many merge steps did it take to find out?
     size_t nZero = 0, nPivot = 0, hopsZero = 0, hopsPivot = 0;
     size_t histZero[8] = {0}, histPivot[8] = {0};
-    // Emergent-pair BLOCKING census: an emergent pair fails when the
-    // column's youngest same-birth face is already a pivot. Record, per
-    // (column is virtual?, blocking column is virtual?), how often that
-    // happens and how far back the blocker sits in ctr.
     size_t nBlock[2][2] = {{0, 0}, {0, 0}};
     double distBlock[2][2] = {{0, 0}, {0, 0}};
     size_t histBlock[2][2][8] = {{{0}}};
-    size_t nNoFace[2] = {0, 0};       // no same-birth face at all
-    size_t nEmergentBy[2] = {0, 0};   // emergent pairs, by column virtuality
-    size_t nColBy[2] = {0, 0};        // columns entering, by virtuality
-    // Pivot outcome by (column virtual?, pivot cell virtual?), with hops.
+    size_t nNoFace[2] = {0, 0};
+    size_t nEmergentBy[2] = {0, 0};
+    size_t nColBy[2] = {0, 0};
     size_t nPivotBy[2][2] = {{0, 0}, {0, 0}};
     size_t hopsPivotBy[2][2] = {{0, 0}, {0, 0}};
     size_t nZeroBy[2] = {0, 0};
     size_t hopsZeroBy[2] = {0, 0};
-    size_t nNonzeroPersBy[2] = {0, 0};   // pivot.birth != column.birth
+    size_t nNonzeroPersBy[2] = {0, 0};
     size_t nEmergentNonzeroBy[2] = {0, 0};
     auto bucket = [](size_t r) -> int {
         if (r < 3) { return static_cast<int>(r); }
@@ -1040,20 +946,13 @@ void Dimension1::computePairsUnified(vector<Cube> &ctr, uint8_t k
 #endif
                     pivotColumnIndex.emplace(pivot.index, i);
                     if (pivot.birth != ctr[i].birth) {
-                        // Every bar the reduction emits reaches the matching;
-                        // a kept edge at or above tau is a real edge of the
-                        // filtration at a voxel the other input puts below
-                        // threshold.
                         const bool censored =
                             cone != nullptr && isVirtualCell(ctr[i].index);
                         if (computePairsMode == INPUT_PAIRS) {
                             matchMap.emplace(pivot.index, Pair(pivot, ctr[i]));
                             if (censored) {
-                                // The death column is a cone 2-cell at
-                                // CONE_BIRTH with no voxel. Surface the BIRTH
-                                // edge through the essentials head, whose loss
-                                // semantics is "no death term, gradient on the
-                                // birth voxel only".
+                                // The class dies at the cone, so its death is
+                                // CONE_BIRTH and only the birth is reported.
                                 vector<Cube> &ess =
                                     (k == 0) ? essentials0 : essentials1;
                                 unordered_map<uint64_t, size_t> &cix =
@@ -1064,14 +963,6 @@ void Dimension1::computePairsUnified(vector<Cube> &ctr, uint8_t k
                                 pairs.push_back(Pair(pivot, ctr[i]));
                             }
                         } else if (computePairsMode == COMPARISON_PAIRS) {
-                            // A censored comparison pair MUST still be pushed:
-                            // computeMatching() iterates pairsComp to drive the
-                            // death-cube join, so skipping it silently loses
-                            // every censored match. Its virtual death cell is
-                            // never dereferenced -- computeVoxels only reads a
-                            // comparison pair's death for entries recorded in
-                            // isMatchedWithIndexComp, which censored matches
-                            // deliberately do not set.
                             pairs.push_back(Pair(pivot, ctr[i]));
 #ifdef USE_ISPAIRED
                             isPairedComp.emplace(ctr[i].index, true);

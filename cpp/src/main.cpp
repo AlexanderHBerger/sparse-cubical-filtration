@@ -135,7 +135,6 @@ int main(int argc, char **argv) {
     {
         vector<index_t> shape0;
         vector<index_t> shape1;
-        // readImage reads double; value_t may be float (-DVALUE_T_FLOAT).
         vector<double> image0;
         vector<double> image1;
         readImage(filename0, format0, image0, shape0);

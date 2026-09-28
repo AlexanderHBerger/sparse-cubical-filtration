@@ -39,9 +39,6 @@ Dimension2::Dimension2(const CubicalGridComplex &_cgc0,
       uf0(UnionFindDual(cgc0, _kept, _pockets, CONE_BIRTH)),
       uf1(UnionFindDual(cgc1, _kept, _pockets, CONE_BIRTH)),
       ufComp(UnionFindDual(cgcComp, _kept, _pockets, CONE_BIRTH)) {
-    // Pockets are born at CONE_BIRTH in ALL THREE complexes -- the masked
-    // region is the same set in I, J and C and enters as one terminal slice.
-    // Seeding is redone after every reset() below; it MUST be, for all three.
     uf0.seedPockets();
     uf1.seedPockets();
     ufComp.seedPockets();
@@ -142,9 +139,6 @@ void Dimension2::enumerateDualEdges(vector<Cube> &dualEdges,
 #endif
 
     if (sparse) {
-        // Only kept 2-cells can pass the birth filter (shared mask), so
-        // iterate the kept list -- its canonical (x,y,z,type) order equals
-        // the full-grid visit order restricted to kept cells.
         for (const uint64_t key : kept->keptTwoCells) {
             const index_t x = (key >> 44) & 0xfffff;
             const index_t y = (key >> 24) & 0xfffff;
@@ -154,8 +148,6 @@ void Dimension2::enumerateDualEdges(vector<Cube> &dualEdges,
             if (birth < config.threshold) {
 #ifdef USE_APPARENT_PAIRS
                 dualEdge = Cube(birth, x, y, z, type);
-                // Sparse mode is not supported with apparent pairs (see
-                // Dimension1::computePairsAndMatch), so the filter is off.
                 if (!config.sparseComplex &&
                     isApparentPair(dualEdge, enumerator, coEnumerator)) {
 #ifdef RUNTIME
@@ -251,7 +243,6 @@ void Dimension2::enumerateDualEdgesComp(vector<Cube> &dualEdges) const {
     bool binaryInputs = true;
 #endif
     if (sparse) {
-        // Kept-2-cell list iteration (see enumerateDualEdges).
         for (const uint64_t key : kept->keptTwoCells) {
             const index_t x = (key >> 44) & 0xfffff;
             const index_t y = (key >> 24) & 0xfffff;
@@ -332,7 +323,6 @@ void Dimension2::computeInputAndImagePairs(vector<Cube> &dualEdges,
 
     for (auto edge = dualEdges.rbegin(), last = dualEdges.rend(); edge != last;
          ++edge) {
-        // Sparse: masked top cells resolve to their pocket's virtual node.
         boundaryIndices = uf.getBoundaryIndices(*edge);
         parentIdx0 = uf.find(boundaryIndices[0]);
         parentIdx1 = uf.find(boundaryIndices[1]);
@@ -344,25 +334,8 @@ void Dimension2::computeInputAndImagePairs(vector<Cube> &dualEdges,
             birthIdxComp = ufComp.link(parentIdx0, parentIdx1);
             if (edge->birth != birth) {
                 if (uf.isPocketNode(birthIdx)) {
-                    // CENSORED: the dying root is a virtual pocket, so the
-                    // death is CONE_BIRTH and there is no death voxel. A
-                    // pocket is elder to every kept top cell -- it sits at or
-                    // above all of them, and at a tie link()'s original-index
-                    // rule (pocket ids lie above every cube id) lets the CUBE
-                    // die -- so this fires only for pocket-vs-pocket and
-                    // pocket-vs-sentinel merges, exactly the genuine cavity
-                    // deaths. A cavity whose closing face is itself at
-                    // CONE_BIRTH is a zero-persistence pair and is dropped by
-                    // the check above, as in the dense filtration. Record the
-                    // BIRTH cell; the loss's essential head already means
-                    // "death censored, gradient on the birth voxel only".
-                    //
-                    // This holds for every birth value: a cavity whose closing
-                    // face sits at or above tau in this input is one this
-                    // input nearly has -- the other input closes it -- and it
-                    // must stay both surfaced and matchable, or the other
-                    // side's cavity goes unmatched with no loss term to act
-                    // on it.
+                    // The dying root is a pocket: the class is censored at
+                    // CONE_BIRTH and stored by its birth cell.
                     essentials.push_back(*edge);
                     censoredMatchMap.emplace(birthIdxComp,
                                              essentials.size() - 1);
@@ -384,11 +357,6 @@ void Dimension2::computeInputAndImagePairs(vector<Cube> &dualEdges,
                   [](const Cube &cube) { return cube.index == NONE_INDEX; });
     dualEdges.erase(new_end, dualEdges.end());
 
-    // Sparse: every kept top cell's dual edges are kept, so the dual graph
-    // reaches a pocket or the exterior from everywhere and NOTHING survives --
-    // every top-dim class dies by CONE_BIRTH, because the box is acyclic. The
-    // scan over the kept top cells (compact ids 0..K-1; the exterior sentinel
-    // and the pockets come after them) is a safety net only.
     if (config.sparseComplex) {
         const index_t numTopCells =
             static_cast<index_t>(kept->keptTopCells.size());
@@ -399,9 +367,6 @@ void Dimension2::computeInputAndImagePairs(vector<Cube> &dualEdges,
                 value_t rootBirth = uf.getBirth(idx);
                 if (rootBirth != INFTY &&
                     rootBirth < config.maskThreshold) {
-                    // Keyed on the COMP dual root (the lockstep ufComp
-                    // partition agrees with the comp pass's final partition;
-                    // roots are order-independent).
                     if (rootBirth < TAU_REAL) {
                         essentialMatchMap.emplace(ufComp.find(idx),
                                                   essentials.size());
@@ -431,13 +396,6 @@ void Dimension2::computeCompPairsAndMatch(vector<Cube> &dualEdges,
 #endif
 
     ufComp.reset();
-    // reset() undoes the constructor's seeding, so re-seed here exactly as
-    // computeInputAndImagePairs does. Without it the comparison sweep would
-    // treat every boundary-touching pocket as a free node while both input
-    // sweeps have it in the sentinel: each such pocket would produce one
-    // extra merge in the comparison only (a phantom censored cavity) and
-    // clear one extra 2-cell from the comparison's dim-1 worklist, breaking
-    // the death-cube join even for identical inputs.
     ufComp.seedPockets();
     vector<index_t> boundaryIndices(2);
     index_t parentIdx0;
@@ -462,13 +420,6 @@ void Dimension2::computeCompPairsAndMatch(vector<Cube> &dualEdges,
             birth = ufComp.getBirth(birthIdx);
             if (edge->birth != birth) {
                 if (ufComp.isPocketNode(birthIdx)) {
-                    // Censored on the comparison side too: join the two input
-                    // sides' censored records under the same comparison root,
-                    // exactly as the finite path joins through matchMap0/1. A
-                    // mixed case (censored on one side, finite on the other)
-                    // cannot arise: a pocket sits at CONE_BIRTH, above every
-                    // kept top cell, so it only ever dies against another
-                    // pocket or the sentinel, in every one of the three UFs.
                     auto c0 = censoredMatchMap0.find(birthIdx);
                     auto c1 = censoredMatchMap1.find(birthIdx);
                     if (c0 != censoredMatchMap0.end() &&
@@ -500,8 +451,6 @@ void Dimension2::computeCompPairsAndMatch(vector<Cube> &dualEdges,
         } else {
 #ifdef USE_APPARENT_PAIRS_COMP
             ctrImage.push_back(*edge);
-            // Sparse mode does not use apparent pairs (see
-            // enumerateDualEdges).
             if (!config.sparseComplex &&
                 isApparentPair(*edge, enumeratorComp, coEnumeratorComp)) {
                 edge->index = NONE_INDEX;
@@ -521,10 +470,6 @@ void Dimension2::computeCompPairsAndMatch(vector<Cube> &dualEdges,
     reverse(ctrImage.begin(), ctrImage.end());
 #endif
 
-    // Essential pass (top dimension): surviving kept comp dual roots are
-    // joined directly on the comp root; uf0/uf1 retain their input-pass final
-    // state for the TAU_REAL gate. Nothing survives in sparse mode (see
-    // computeInputAndImagePairs), so this is a safety net only.
     if (config.sparseComplex) {
         const index_t numTopCells =
             static_cast<index_t>(kept->keptTopCells.size());

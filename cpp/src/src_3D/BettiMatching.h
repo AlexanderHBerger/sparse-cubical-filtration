@@ -25,10 +25,6 @@ class BettiMatching {
     const vector<vector<VoxelMatch>> &matched = _matched;
     const vector<vector<VoxelPair>> &unmatched0 = _unmatched0;
     const vector<vector<VoxelPair>> &unmatched1 = _unmatched1;
-    // Sparse mode only (empty otherwise): birth voxels of the censored
-    // ("essential") bars per homology dimension. Matched lists are
-    // row-aligned across the two inputs; unmatched lists exclude matched
-    // classes and are gated per-side by TAU_REAL.
     const vector<vector<vector<index_t>>> &unmatchedEssentials0 =
         _unmatchedEssentials0;
     const vector<vector<vector<index_t>>> &unmatchedEssentials1 =
@@ -37,22 +33,14 @@ class BettiMatching {
         _matchedEssentials0;
     const vector<vector<vector<index_t>>> &matchedEssentials1 =
         _matchedEssentials1;
-    // Comparison pair per (finite) match, row-aligned with `matched`.
     const vector<vector<VoxelPair>> &matchedComp = _matchedComp;
 
   private:
     CubicalGridComplex cgc0;
     CubicalGridComplex cgc1;
     CubicalGridComplex cgcComp;
-    // Kept-cell index, built once from cgcComp in sparse mode (nullptr in
-    // dense mode). Held behind a unique_ptr so its address survives moves of
-    // this object (the sparse maps and union-finds point at it).
     std::unique_ptr<KeptCells> keptCells;
-    // Virtual pocket nodes, built from config.pocketLabels (nullptr in dense
-    // mode). unique_ptr for the same stable-address reason as keptCells: the
-    // dual union-finds hold a raw pointer to it.
     std::unique_ptr<PocketNodes> pocketNodes;
-    // Dim-1 cone incidence (nullptr in dense mode).
     std::unique_ptr<ConeIndex> coneIndex;
     vector<vector<Pair>> pairs0;
     vector<vector<Pair>> pairs1;
@@ -74,11 +62,6 @@ class BettiMatching {
     vector<vector<VoxelPair>> _matchedComp;
     Config config;
 #ifdef USE_CACHE
-    // Working caches of the dim-1 reductions (allocated lazily right
-    // before use -- computeMatching needs all three, computePairsInput0 only
-    // the input-0 one). Retained after matching solely for
-    // computeRepresentativeCycles; config.releaseCachesAfterMatching frees
-    // them early (representative cycles then throw).
     optional<SparseOrDenseCubeMap<2, vector<Cube>>> dim1CacheInputPairs0;
     optional<SparseOrDenseCubeMap<2, vector<Cube>>> dim1CacheInputPairs1;
     optional<SparseOrDenseCubeMap<2, vector<Cube>>> dim1CacheCompPairs;

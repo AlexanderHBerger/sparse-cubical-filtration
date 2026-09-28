@@ -27,9 +27,6 @@ typedef py::array_t<value_t, py::array::c_style> TypedInputVolume;
 typedef std::tuple<vector<vector<VoxelMatch>>, vector<vector<VoxelPair>>,
                    vector<vector<VoxelPair>>>
     BettiMatchingPairsResult;
-// Sparse-complex essential classes: birth voxel coordinates per homology
-// dimension ([dim][record][axis]). Matched lists are row-aligned across the
-// two inputs.
 typedef vector<vector<vector<index_t>>> EssentialVoxelsByDim;
 struct SparseEssentialsPayload {
     EssentialVoxelsByDim unmatched1;
@@ -58,10 +55,6 @@ struct BettiMatchingResult {
     std::optional<std::vector<py::array_t<int64_t>>>
         input2UnmatchedDeathCoordinates;
     std::optional<py::array_t<int64_t>> numUnmatchedInput2;
-    // Sparse-complex essential (censored) bars (present iff sparse=True; the
-    // Python attributes raise AttributeError in dense mode). They carry only a
-    // birth voxel: their death is censored at CONE_BIRTH (or +inf for the one
-    // class of dimension 0 that never dies), so there is no death voxel.
     std::optional<py::array_t<int64_t>> numMatchedEssentials;
     std::optional<std::vector<py::array_t<int64_t>>>
         input1MatchedEssentialBirthCoordinates;
@@ -73,8 +66,6 @@ struct BettiMatchingResult {
         input1UnmatchedEssentialBirthCoordinates;
     std::optional<std::vector<py::array_t<int64_t>>>
         input2UnmatchedEssentialBirthCoordinates;
-    // Comparison pair per match, row-aligned with the matched arrays;
-    // present iff include_comparison_matched_pairs=True.
     std::optional<std::vector<py::array_t<int64_t>>>
         comparisonMatchedBirthCoordinates;
     std::optional<std::vector<py::array_t<int64_t>>>
@@ -116,9 +107,6 @@ string repr_vector(const vector<T> shape,
     return out_stream.str();
 };
 
-// Build a Config from the keyword arguments shared by the matching entry
-// points. The sparse arguments are only legal together with sparse=True, so the
-// dense path cannot be perturbed.
 Config makeConfigFromKwargs(bool sparse, value_t maskThreshold,
                             bool releaseCachesAfterMatching = false,
                             std::shared_ptr<const vector<int32_t>>
@@ -127,7 +115,6 @@ Config makeConfigFromKwargs(bool sparse, value_t maskThreshold,
     Config config;
     config.sparseComplex = sparse;
     config.maskThreshold = maskThreshold;
-    // General knob (dense + sparse): memory lifetime only, never results.
     config.releaseCachesAfterMatching = releaseCachesAfterMatching;
     if (!sparse) {
         if (maskThreshold != INFTY) {
@@ -143,8 +130,7 @@ Config makeConfigFromKwargs(bool sparse, value_t maskThreshold,
     }
     if (maskThreshold == INFTY) {
         throw invalid_argument(
-            "sparse=True requires a finite mask_threshold: the whole "
-            "construction is defined relative to it");
+            "sparse=True requires a finite mask_threshold");
     }
     if (pocketLabels == nullptr) {
         throw invalid_argument(
@@ -156,9 +142,6 @@ Config makeConfigFromKwargs(bool sparse, value_t maskThreshold,
     return config;
 }
 
-// Validate and adopt the caller's fine pocket labels. Kept deliberately strict:
-// a mismatched or non-canonical labelling would corrupt the virtual node ids
-// silently rather than fail, and those ids drive the tie-break order.
 static std::shared_ptr<const vector<int32_t>>
 adoptPocketLabels(const py::array_t<int32_t> &labels,
                   const vector<index_t> &shape, bool validate) {
@@ -181,8 +164,6 @@ adoptPocketLabels(const py::array_t<int32_t> &labels,
     const int32_t *src = static_cast<const int32_t *>(buf.ptr);
     std::copy(src, src + expected, out->begin());
     if (validate) {
-        // Canonical: ids first appear in increasing raster order. This is what
-        // makes the scipy / cc3d / cupy backends interchangeable.
         int32_t seen = 0;
         for (const int32_t v : *out) {
             if (v < 0) {
@@ -309,9 +290,6 @@ vector<BettiMatchingResult> computeMatchingFromInputs(
 
     // Create one asynchronous task for Betti matching computation per input in
     // the batch
-    // Sparse mode: the pockets are per sample, so each task gets its own Config
-    // copy carrying that sample's labels. Config is copied by value into the
-    // task anyway, and pocketLabels is a shared_ptr, so this is free.
     if (!perSamplePocketLabels.empty() &&
         perSamplePocketLabels.size() != inputs1.size()) {
         throw invalid_argument(
@@ -377,8 +355,6 @@ computeBarcodeFromInputs(vector<InputVolume> &untypedInputs) {
     return arrayResults;
 }
 
-// Convert essential birth-voxel lists ([dim][record][axis]) into per-dim
-// (n, numDimensions) int64 arrays plus a per-dim count array.
 pair<py::array_t<int64_t>, vector<py::array_t<int64_t>>>
 essentialVoxelsToArrays(const EssentialVoxelsByDim &voxels,
                         size_t numDimensions) {
@@ -657,10 +633,6 @@ py::array_t<int64_t> coordinateListToArray(
 }
 
 PYBIND11_MODULE(betti_matching, m) {
-    // The numpy dtype this build expects for input volumes (value_t). Callers
-    // pass float64 for the default build, float32 for the -DVALUE_T_FLOAT
-    // (fp32) variant. `.noconvert()` on the inputs means the wrong dtype
-    // raises rather than silently copy-converting.
     m.attr("value_dtype") =
         py::dtype::of<value_t>().attr("name").cast<string>();
 
@@ -731,11 +703,11 @@ PYBIND11_MODULE(betti_matching, m) {
             unmatched pairs are not needed, such as in training with the Betti
             matching loss, where they do not contribute to the gradient.
         sparse : bool, optional
-            Compute the sparse (pocket-cone) Betti matching instead of the dense
-            one. Both inputs must then be masked identically: a voxel is kept
-            iff min(input1, input2) < mask_threshold, and every other voxel
-            must be set to +inf in BOTH inputs. Kept values must lie in
-            [0, 1] (the fg-low convention g = 1 - p). Default is False.
+            Compute Betti matching on the sparse cubical complex. Both inputs
+            must then be masked identically: a voxel is kept iff
+            min(input1, input2) < mask_threshold, and all other voxels are set
+            to +inf in both inputs. Kept values must lie in [0, 1] (g = 1 - p).
+            Default is False.
         mask_threshold : float, optional
             The mask threshold tau used to build the masked inputs. Required
             (finite) iff sparse=True.
@@ -798,10 +770,6 @@ PYBIND11_MODULE(betti_matching, m) {
                           (*pocketLabels)[i], shape, validatePocketLabels));
                   }
               }
-              // The shared Config carries the mode; the per-sample labels are
-              // injected inside the fan-out. Pass sample 0's labels here only
-              // so makeConfigFromKwargs' "sparse requires pocket_labels"
-              // check sees them.
               return computeMatchingFromInputs(
                   untypedInputs1, untypedInputs2, includeInput1UnmatchedPairs,
                   includeInput2UnmatchedPairs,
@@ -1488,9 +1456,6 @@ PYBIND11_MODULE(betti_matching, m) {
                       &BettiMatchingResult::input2UnmatchedBirthCoordinates)
         .def_readonly("input2_unmatched_death_coordinates",
                       &BettiMatchingResult::input2UnmatchedDeathCoordinates)
-        // Censored ("essential") bars of the sparse matching: present iff
-        // the run used sparse=True; accessing them on a dense result raises
-        // AttributeError.
         .def_property_readonly(
             "num_matched_essentials",
             [](const BettiMatchingResult &self) {

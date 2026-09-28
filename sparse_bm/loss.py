@@ -1,35 +1,9 @@
-"""Sparse Betti-matching loss.
+"""sparseBM loss.
 
-The pipeline is
-
-    masks + pocket labels (GPU if available, non-differentiable)   build_masks()
-      -> ONE batched C++ matching (CPU, one task per sample)         loss_from_masks()
-      -> autograd term assembly                                      terms.assemble_terms
-
-The sparse complex keeps a voxel iff ``min(g_p, g_t) < tau`` (``g = 1 - p``) and adds
-one virtual node per connected masked region (pocket). Its barcode is the persistent
-homology of the kept complex at the inputs' own values, every class that survives in
-it censored at ``CONE_BIRTH = 1``, the background value -- for a binary target
-literally its dense barcode (see ``masks.lift_masked``). Censored bars arrive on the
-essential channels of the matching result.
-
-The loss terms (see ``terms``):
-  * finite matched pairs -- birth and death pulled to the target's values;
-  * matched essentials   -- birth pulled to the target's birth (no death term:
-                            both deaths are censored);
-  * unmatched prediction bars -- every endpoint pulled to the bar's other
-                            endpoint, which for an essential is background, or
-                            (``unmatched_target="gt"``) to the GT value there;
-  * unmatched target bars -- no term, no gradient.
-
-Two penalties, ``penalty_matched`` and ``penalty_unmatched``, each "ce" or "se",
-defaulting to ce on matched and se on unmatched. "ce" is the ordinary
-classification loss on the classifier's LOGITS, so a ce configuration passes
-``logits=(B, C, *spatial)`` alongside the foreground probability.
-
-Value convention: g = 1 - image (foreground low); tau_mask = 1 - theta unless
-overridden. All matching decisions live in the C++ matcher; this module only turns
-the returned coordinates into loss terms.
+The loss runs in two steps: ``build_masks`` computes the masked inputs and the pocket
+labels (on the GPU if available), and ``loss_from_masks`` runs the C++ matching on the
+CPU, one thread per batch element, and assembles the loss terms. Filtration values are
+g = 1 - p, so foreground is low.
 """
 
 from __future__ import annotations
@@ -47,17 +21,14 @@ _BM = None
 
 
 def _get_bm():
-    """The compiled matcher (``betti_matching``, built from ``cpp/``)."""
     global _BM
     if _BM is None:
-        import betti_matching as _bm  # resolved via PYTHONPATH
+        import betti_matching as _bm
         _BM = _bm
     return _BM
 
 
 def _value_dtype():
-    """numpy dtype the loaded matcher build expects (float64, or float32 for the
-    -DVALUE_T_FLOAT build)."""
     return np.dtype(getattr(_get_bm(), "value_dtype", "float64"))
 
 
@@ -66,25 +37,10 @@ CLAMP_OFF = 1.0
 
 def clamp_for_matching(m_p: np.ndarray, clamp_confident: float,
                        tau_mask: float) -> np.ndarray:
-    """Confident-foreground clamp, applied ONLY to the matching input.
+    """Set ``g_p <= 1 - clamp_confident`` to 0 in a copy of the matcher input.
 
-    Collapses ``p >= clamp_confident`` (i.e. ``g_p <= 1 - clamp_confident``) onto a
-    single value, manufacturing ties so more columns resolve as emergent pairs, which
-    makes the matching cheaper.
-
-    Returns a SEPARATE array. The caller keeps the unclamped ``m_p`` for the term
-    assembly, so the clamp changes only WHICH cells pair with which; every
-    birth/death value the loss and gradient use is still exact.
-
-    Only the confident FOREGROUND end is clamped: a confident *background* voxel
-    survives the mask only where the ground truth says foreground, so those voxels
-    are exactly the model's false negatives, and clamping them would zero the
-    gradient on its own mistakes.
-
-    The kept set is unchanged: masked cells are +inf, and every clamped value moves
-    from ``(0, 1 - clamp_confident]`` to 0 while staying below ``tau_mask``, so
-    ``keep = min(g_p, g_t) < tau`` cannot flip. That requires
-    ``1 - clamp_confident < tau_mask``, which is asserted.
+    The ties make the matching cheaper. Only the matcher sees the clamped values; the
+    loss terms read the original ones.
     """
     if clamp_confident >= CLAMP_OFF:
         return m_p
@@ -100,21 +56,13 @@ def clamp_for_matching(m_p: np.ndarray, clamp_confident: float,
 
 
 def fine_pocket_labels(keep) -> np.ndarray:
-    """Pocket labelling of a kept mask -> host int32 array.
-
-    ``keep`` may be a numpy array or a torch tensor. A CUDA tensor is labelled
-    on-device through cupy when cupy is importable (``label_pockets`` accepts a cupy
-    array and returns host tables, byte-identical to the CPU backend), and otherwise
-    falls back to a host transfer -- correctness never depends on the GPU being
-    available.
-    """
+    """Pocket labels (int32, on the host) of a kept mask given as numpy array or torch
+    tensor. CUDA tensors are labelled with cupy if it is installed."""
     if isinstance(keep, torch.Tensor):
         if keep.is_cuda:
             try:
                 import cupy as cp
 
-                # uint8 rather than bool: torch's dlpack bool support is version
-                # dependent, uint8 is not, and the astype below is free.
                 dev = cp.from_dlpack(
                     keep.detach().to(torch.uint8).contiguous()).astype(cp.bool_)
                 return np.ascontiguousarray(label_pockets(dev).fine)
@@ -126,12 +74,7 @@ def fine_pocket_labels(keep) -> np.ndarray:
 
 def match_sparse(m_p: np.ndarray, m_t: np.ndarray, pocket_labels: np.ndarray,
                  tau_mask: float, clamp_confident: float = CLAMP_OFF):
-    """Run the sparse matcher on already-masked arrays (see ``masks``).
-
-    The arrays go in unmodified apart from the optional confident-foreground clamp.
-    The matcher re-derives the kept set from the +inf sentinels and validates
-    ``pocket_labels`` against it on every call.
-    """
+    """Sparse matching of two masked filtrations (see ``make_sparse_pair``)."""
     return _get_bm().compute_matching(
         clamp_for_matching(m_p, clamp_confident, tau_mask), m_t,
         sparse=True, mask_threshold=tau_mask, pocket_labels=pocket_labels)
@@ -139,13 +82,8 @@ def match_sparse(m_p: np.ndarray, m_t: np.ndarray, pocket_labels: np.ndarray,
 
 def sparse_matching(pred_np: np.ndarray, target_np: np.ndarray, tau_mask: float,
                     clamp_confident: float = CLAMP_OFF):
-    """Masks + pocket labels + matching for one (prediction, target) pair.
-
-    ``pred_np`` / ``target_np`` are foreground probabilities (image values, fg high).
-    Returns ``(res, m_p, m_t, keep, labels)``; ``m_p`` / ``m_t`` are the masked
-    filtrations (``g = 1 - image``, +inf off the mask) the loss terms read, cast to
-    the build's value dtype.
-    """
+    """Mask, pocket labels and sparse matching for one pair of foreground probability
+    maps. Returns ``(res, m_p, m_t, keep, labels)``."""
     vd = _value_dtype()
     g_p = np.ascontiguousarray((1.0 - pred_np).astype(np.float64))
     g_t = np.ascontiguousarray((1.0 - target_np).astype(np.float64))
@@ -162,14 +100,8 @@ def sparse_matching(pred_np: np.ndarray, target_np: np.ndarray, tau_mask: float,
 def terms_on_arrays(res, m_p, m_t, dims, unmatched_weight=1.0,
                     essential_weight=1.0, matched_weight=1.0,
                     unmatched_target="diagonal"):
-    """(loss, d loss / d pred, per_dim) for one matching result, se on both halves.
-
-    The same assembly the training path runs, on numpy arrays: ``m_p`` is the masked
-    prediction filtration (+inf off the mask), the returned gradient is with respect
-    to the PREDICTION (``d g_p / d pred = -1`` folded in) and is zero off the critical
-    cells. A "ce" penalty needs the classifier's logits, so it has no array form; use
-    ``terms.assemble_terms`` directly for it.
-    """
+    """Loss, gradient with respect to the prediction, and per-dimension loss for one
+    matching result on numpy arrays (squared error only)."""
     g_p = torch.tensor(np.asarray(m_p, dtype=np.float64), requires_grad=True)
     loss, per_dim = assemble_terms(
         res, g_p, m_t, dims, unmatched_weight, essential_weight, "se",
@@ -178,28 +110,13 @@ def terms_on_arrays(res, m_p, m_t, dims, unmatched_weight=1.0,
     return float(loss.detach()), (-g_p.grad).numpy(), per_dim
 
 
-# -----------------------------------------------------------------------------
-# Batched mask build (GPU side) and the live loss path
-# -----------------------------------------------------------------------------
-
 def _batched_mask_build(preds, targets, tau, mask_backend):
-    """Masks + PER-SAMPLE pocket labels for a batch (CPU numpy, build dtype).
-
-    On GPU (``make_sparse_pair_torch``, cupy labelling if available) when preds is
-    CUDA; scipy otherwise. Both are non-differentiable functions of the thresholded
-    inputs, so doing them here -- separately from the differentiable loss -- loses
-    no gradient and lets a training loop issue the next GPU forward before the
-    (CPU-heavy) matching runs.
-
-    Returns ``(m_p_list, m_t_list, keep_fracs, pocket_labels)``.
-    """
     B = preds.shape[0]
     vd = _value_dtype()
     use_torch_mask = (mask_backend == "torch"
                       or (mask_backend == "auto" and preds.is_cuda))
     if not np.isfinite(tau):
-        raise ValueError("the sparse matching requires a finite tau: the whole "
-                         "construction is defined relative to it")
+        raise ValueError("the sparse matching requires a finite tau")
     m_p_list, m_t_list, keep_fracs, labels = [], [], [], []
     if use_torch_mask:
         with torch.no_grad():
@@ -228,8 +145,6 @@ def _batched_mask_build(preds, targets, tau, mask_backend):
 
 
 def _match_batch(m_p_list, m_t_list, tau, clamp_confident, pocket_labels):
-    """The one batched C++ call (one std::async task per sample). The confident
-    clamp is MATCHER-ONLY: the terms read the exact masks."""
     match_p = ([clamp_for_matching(mp, clamp_confident, tau) for mp in m_p_list]
                if clamp_confident < CLAMP_OFF else m_p_list)
     return _get_bm().compute_matching(
@@ -242,22 +157,11 @@ def _loss_from_masks(preds, m_p_list, m_t_list, pocket_labels, dims,
                      clamp_confident=CLAMP_OFF, penalty_matched="ce",
                      matched_weight=1.0, unmatched_target="diagonal",
                      penalty_unmatched="se", logits=None, fg_index=1):
-    """C++ matching + the autograd term assembly, from pre-built masks -> mean loss.
-
-    ``preds`` is the foreground probability (B, *spatial) and carries the gradient
-    for every "se" term; ``logits`` is the classifier output (B, C, *spatial) and
-    carries it for every "ce" term. Returns the batch-MEAN loss as a live tensor.
-    """
     B = preds.shape[0]
     results = _match_batch(m_p_list, m_t_list, tau, clamp_confident, pocket_labels)
-    # float64 for the batch mean too, so a float32 prediction's loss is the float64
-    # one to the last bit; only the finished scalar is cast back.
     total = torch.zeros((), dtype=torch.float64, device=preds.device)
     per_dim_sum = {int(d): 0.0 for d in dims}
     for b in range(B):
-        # g_p is finite everywhere -- the +inf sentinels live in m_p_list. No term
-        # ever gathers a masked voxel (critical cells are always kept), so the graph
-        # stays free of infinities.
         lv, pd = assemble_terms(
             results[b], 1.0 - preds[b], m_t_list[b], dims, unmatched_weight,
             essential_weight, penalty_matched, matched_weight, unmatched_target,
@@ -269,62 +173,38 @@ def _loss_from_masks(preds, m_p_list, m_t_list, pocket_labels, dims,
     if stats is not None:
         stats['per_dim'] = {int(d): per_dim_sum[int(d)] / B for d in dims}
     if total.grad_fn is None and preds.requires_grad:
-        # An empty barcode across the whole batch -- a correctly-empty patch, or a
-        # prediction with nothing above the mask threshold -- leaves `total` a
-        # constant, and .backward() on it would raise. One scalar op restores a grad
-        # path without a reduction over the volume.
+        # Empty barcodes: keep the loss connected to the graph so backward() works.
         total = total + preds.reshape(-1)[0].to(torch.float64) * 0.0
     return (total / B).to(preds.dtype)
 
 
 class SparseBettiLossBatched(torch.nn.Module):
-    """Batched sparse Betti-matching loss.
+    """sparseBM loss for a batch of foreground probabilities ``(B, *spatial)``, 2D or 3D.
 
-    ``forward(preds, targets, logits=None)`` takes stacked ``(B, *spatial)`` tensors
-    (foreground probabilities; 2D or 3D) and runs the B per-sample matchings in ONE
-    ``compute_matching([...], [...])`` call, which the C++ matcher parallelises
-    across the batch. Returns the batch MEAN loss. When capture_stats=True,
-    ``last_stats`` holds the batch-mean per-dimension loss, the mean kept fraction
-    and the mean pocket count.
-
-    Split into ``build_masks()`` (GPU, non-differentiable) and ``loss_from_masks()``
-    (CPU C++ matching, differentiable) so a training loop can issue the next forward
-    between them and overlap the CPU matching with the GPU work. ``forward()`` runs
-    both back-to-back.
+    Returns the mean loss over the batch. ``forward`` runs ``build_masks`` and
+    ``loss_from_masks``; calling them separately allows overlapping the CPU matching
+    with GPU work.
 
     Parameters
     ----------
-    unmatched_weight : float
-        Weight of the unmatched-prediction terms (finite bars to their other
-        endpoint, essentials to background / GT).
-    essential_weight : float
-        Weight of the essential (censored) terms (matched birth term + unmatched
-        essentials). 0 disables them.
-    dims : tuple of int or None
-        Homology dimensions to include. None (default) uses every dimension of the
-        input: (0, 1) for 2D, (0, 1, 2) for 3D.
+    unmatched_weight, matched_weight, essential_weight : float
+        Weights of the unmatched, matched and essential (censored) terms.
+    dims : tuple of int, optional
+        Homology dimensions to include. Default: all dimensions of the input.
     theta, tau_mask : float
-        Foreground threshold on IMAGE values; tau_mask = 1 - theta unless given.
-        Must be finite.
+        Foreground threshold on p; tau_mask = 1 - theta unless given.
     mask_backend : str
-        "auto" (torch when the prediction is on the GPU, scipy otherwise), "torch"
-        or "scipy". Both produce identical masks.
+        "auto" (torch on the GPU, scipy otherwise), "torch" or "scipy".
     capture_stats : bool
-        Populate ``last_stats`` (monitoring only; never affects the loss).
+        Store per-dimension loss, kept fraction and pocket count in ``last_stats``.
     clamp_confident : float
-        Collapse ``p >= clamp_confident`` onto one value in the array handed to the
-        matcher (ties -> cheaper matching). The loss terms still read EXACT values,
-        so this changes only which cells pair with which. 1.0 disables it.
+        See ``clamp_for_matching``. 1.0 disables it.
     penalty_matched, penalty_unmatched : str
-        "ce" or "se", independent; default ce on matched, se on unmatched. A "ce"
-        half needs ``logits`` at call time.
-    matched_weight : float
-        Weight on the matched terms (finite pairs + matched essentials).
+        "se" (squared error on g) or "ce" (cross-entropy on ``logits``).
     unmatched_target : str
-        "diagonal" (every endpoint -> the bar's other endpoint; background for an
-        essential) or "gt" (the GT value at the voxel).
+        "diagonal" or "gt", see ``terms``.
     fg_index : int
-        Which softmax channel is the foreground, for the ce terms' logit gather.
+        Foreground channel of ``logits``.
     """
 
     def __init__(self, unmatched_weight: float = 1.0,
@@ -340,8 +220,7 @@ class SparseBettiLossBatched(torch.nn.Module):
         if mask_backend not in ("auto", "scipy", "torch"):
             raise ValueError('mask_backend must be "auto", "scipy" or "torch"')
         if tau_mask is not None and not np.isfinite(float(tau_mask)):
-            raise ValueError("tau_mask must be finite: the mask and the pockets are "
-                             "defined relative to it")
+            raise ValueError("tau_mask must be finite")
         self.unmatched_weight = float(unmatched_weight)
         self.essential_weight = float(essential_weight)
         self.dims = None if dims is None else tuple(int(d) for d in dims)
@@ -372,10 +251,6 @@ class SparseBettiLossBatched(torch.nn.Module):
         return self.dims if self.dims is not None else tuple(range(preds.ndim - 1))
 
     def build_masks(self, preds: torch.Tensor, targets: torch.Tensor):
-        """GPU-side prepare step -> ``(m_p_list, m_t_list, keep_fracs, pocket_labels)``.
-
-        Feed it straight through: ``loss_from_masks(preds, *build_masks(...))``.
-        """
         assert preds.shape == targets.shape
         assert preds.ndim in (3, 4), "batched inputs: (B, *2D) or (B, *3D)"
         return _batched_mask_build(preds, targets, self._tau(), self.mask_backend)
@@ -383,13 +258,6 @@ class SparseBettiLossBatched(torch.nn.Module):
     def loss_from_masks(self, preds: torch.Tensor, m_p_list, m_t_list,
                         keep_fracs, pocket_labels,
                         logits: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """CPU-heavy C++ matching + assembly on pre-built masks -> mean loss.
-
-        ``preds`` is the foreground probability ``(B, *spatial)`` -- the field the
-        matching ran on, and the one every "se" term reads. ``logits`` is the raw
-        classifier output ``(B, C, *spatial)``, required whenever either penalty is
-        "ce": cross-entropy is computed there, never on the probability.
-        """
         if len(pocket_labels) != len(m_p_list):
             raise ValueError(f"pocket_labels has {len(pocket_labels)} entries for "
                              f"{len(m_p_list)} samples")
@@ -416,9 +284,7 @@ class SparseBettiLossBatched(torch.nn.Module):
 
 
 class SparseBettiLoss(SparseBettiLossBatched):
-    """Per-sample convenience: ``forward(pred, target, logits=None)`` on ONE
-    unbatched ``(*spatial)`` pair (``logits`` as ``(C, *spatial)``). Same knobs,
-    same code -- it is the batched class on a batch of one."""
+    """``SparseBettiLossBatched`` for a single unbatched pair."""
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 logits: Optional[torch.Tensor] = None) -> torch.Tensor:

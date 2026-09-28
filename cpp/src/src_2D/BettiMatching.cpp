@@ -19,35 +19,20 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
     : cgc0(input0, shape), cgc1(input1, shape), cgcComp(comparison, shape),
       config(_config) {
     if (config.sparseComplex) {
-        // One O(N) classification pass over the comparison complex; all
-        // sparse-mode structures (compact union-finds, kept-cell
-        // enumerations) index through it. Masked voxels are INFTY in both
-        // inputs (shared mask), so this single kept set serves all three
-        // complexes and both image complexes.
         keptCells = std::make_unique<KeptCells>(cgcComp);
         if (config.pocketLabels == nullptr) {
             throw runtime_error("sparse=True requires pocket_labels");
         }
         pocketNodes =
             std::make_unique<PocketNodes>(cgcComp, *config.pocketLabels);
-        // Every virtual (pocket) node is born at CONE_BIRTH, the
-        // background value, and no real cell of the kept complex may lie
-        // above it (equal is fine: the dual union-find orders every
-        // pocket after every kept top cell at equal value). A cell's
-        // V-construction value is the max over its corner voxels, so
-        // checking the kept VOXELS covers every kept cell of every
-        // dimension in all three complexes. O(K), kept voxels only.
         for (const index_t v : keptCells->keptVertices) {
             const index_t x = v / cgcComp.shape[1];
             const index_t y = v % cgcComp.shape[1];
             if (cgc0.getBirth(x, y) > CONE_BIRTH ||
                 cgc1.getBirth(x, y) > CONE_BIRTH) {
                 throw runtime_error(
-                    "sparse=True requires every kept "
-                    "voxel to be at most CONE_BIRTH (1.0), the background "
-                    "value the virtual pocket cells carry; found one "
-                    "above it. Inputs are expected in the fg-low "
-                    "[0, 1] convention.");
+                    "sparse=True requires all kept values to be at most "
+                    "1.0 (inputs are g = 1 - p in [0, 1])");
             }
         }
     }
@@ -71,14 +56,9 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
     _matchedComp = vector<vector<VoxelPair>>(2);
 }
 
-// Move every container member (a member-wise copy would be an O(pairs) deep
-// copy on every construction through the dispatch variant).
 BettiMatching::BettiMatching(BettiMatching &&other)
     : cgc0(std::move(other.cgc0)), cgc1(std::move(other.cgc1)),
       cgcComp(std::move(other.cgcComp)), config(other.config),
-      // Moving the unique_ptr keeps the KeptCells object at the same
-      // address, so the kept pointers stored inside the compact union-finds
-      // stay valid across the move.
       keptCells(std::move(other.keptCells)),
       pocketNodes(std::move(other.pocketNodes)),
       pairs0(std::move(other.pairs0)), pairs1(std::move(other.pairs1)),
@@ -168,8 +148,6 @@ void BettiMatching::computeVoxels() {
                 VoxelPair(cgc1.getParentVoxel(match.pair1.birth, d),
                           cgc1.getParentVoxel(match.pair1.death, d + 1))));
         }
-        // Comparison pair per match, row-aligned with `matched`. (VoxelPair
-        // is not assignable, hence the pointers.)
         vector<const Pair *> compByMatch(matches[d].size(), nullptr);
         for (auto &pair : pairsComp[d]) {
             auto find = isMatchedWithIndexComp[d].find(pair.birth.index);
@@ -188,9 +166,6 @@ void BettiMatching::computeVoxels() {
                           cgcComp.getParentVoxel(compPair->death, d + 1)));
         }
 
-        // Sparse essentials (censored bars): every record is represented by
-        // its BIRTH cell, a d-cell. Matched classes surface row-aligned;
-        // unmatched surfacing applies the per-side TAU_REAL gate.
         const uint8_t cellDim = d;
         vector<bool> isEssMatched0(essentials0[d].size(), false);
         vector<bool> isEssMatched1(essentials1[d].size(), false);

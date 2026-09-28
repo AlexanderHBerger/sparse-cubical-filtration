@@ -23,13 +23,10 @@ class BettiMatching {
     tuple<vector<vector<VoxelMatch>>, vector<vector<VoxelPair>>,
           vector<vector<VoxelPair>>>
     getMatching();
-    // Sparse mode only (empty in dense mode): birth voxels of the censored
-    // ("essential") bars per input and homology dimension.
     pair<vector<vector<vector<index_t>>>, vector<vector<vector<index_t>>>>
     getUnmatchedEssentialBirthVoxels();
     pair<vector<vector<vector<index_t>>>, vector<vector<vector<index_t>>>>
     getMatchedEssentialBirthVoxels();
-    // Comparison pair per match, row-aligned with the matched lists.
     vector<vector<VoxelPair>> getComparisonMatchedVoxels();
     variant<tuple<vector<dim1::RepresentativeCycle>,
                   vector<dim1::RepresentativeCycle>>,

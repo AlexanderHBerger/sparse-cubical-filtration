@@ -207,15 +207,9 @@ void CubicalGridComplex::getGridFromVector(const vector<value_t> &vec) {
     }
 }
 
-// One canonical-order scan of the comparison complex; the kept lists
-// replicate the visit order of the full-grid enumerations exactly
-// (vertices/edges: (x,y[,type]) over shape; top cells: (x,y) over
-// (m_x,m_y) as in the UnionFindDual constructor).
 KeptCells::KeptCells(const CubicalGridComplex &cgcComp) {
     const vector<index_t> &shape = cgcComp.shape;
 
-    // Vertices: slot = dense vertex id (x*n_y + y), the id space of the
-    // dim-0 UnionFind.
     const size_t numVertices = static_cast<size_t>(shape[0]) * shape[1];
     compactVertex.assign(numVertices, -1);
     {
@@ -231,9 +225,6 @@ KeptCells::KeptCells(const CubicalGridComplex &cgcComp) {
         }
     }
 
-    // Edges: kept list only (packed cube keys) -- 2D has no CubeMaps, so
-    // nothing ever looks an edge up by key. Out-of-grid cells read the
-    // INFTY padding and classify as absent.
     for (index_t x = 0; x < shape[0]; ++x) {
         for (index_t y = 0; y < shape[1]; ++y) {
             for (uint8_t type = 0; type < 2; ++type) {
@@ -245,8 +236,6 @@ KeptCells::KeptCells(const CubicalGridComplex &cgcComp) {
         }
     }
 
-    // Top cells: the UnionFindDual node id space (x*m_y + y); the exterior
-    // sentinel (m_xy) is handled by the compact dual UF itself.
     const size_t numTopCells = cgcComp.getNumberOfCubes(2);
     compactTopCell.assign(numTopCells, -1);
     {
@@ -278,8 +267,6 @@ PocketNodes::PocketNodes(const CubicalGridComplex &cgcComp,
             throw runtime_error("pocket_labels must be non-negative");
         }
     }
-    // The labelling must be nonzero EXACTLY on the masked voxels -- see the 3D
-    // version for why a mismatch would otherwise pass silently.
     for (index_t x = 0; x < sx; ++x) {
         for (index_t y = 0; y < sy; ++y) {
             const bool masked = cgcComp.getBirth(x, y) == INFTY;
@@ -292,10 +279,6 @@ PocketNodes::PocketNodes(const CubicalGridComplex &cgcComp,
     }
     boundary.assign(static_cast<size_t>(n) + 1, 0);
     topCellPocket.assign(static_cast<size_t>(cgcComp.m_xy), 0);
-    // Top cell (x,y) spans vertices {x,x+1} x {y,y+1}; it is non-kept iff any
-    // corner is masked, and its pocket is the max over the corner labels
-    // (kept corners contribute 0, and all masked corners of one top cell share
-    // a label).
     for (index_t x = 0; x < cgcComp.m_x; ++x) {
         for (index_t y = 0; y < cgcComp.m_y; ++y) {
             int32_t best = 0;
@@ -311,7 +294,6 @@ PocketNodes::PocketNodes(const CubicalGridComplex &cgcComp,
             topCellPocket[x * cgcComp.m_y + y] = best;
         }
     }
-    // Boundary pockets: a masked voxel on any grid face.
     for (index_t x = 0; x < sx; ++x) {
         for (index_t y = 0; y < sy; ++y) {
             if (x != 0 && x != sx - 1 && y != 0 && y != sy - 1) {
@@ -340,8 +322,6 @@ UnionFind::UnionFind(const CubicalGridComplex &_cgc, const KeptCells *_kept)
         }
         return;
     }
-    // Compact (sparse) mode: nodes are the kept vertices, in canonical order
-    // (which is increasing dense vertex id).
     const size_t n = kept->keptVertices.size();
     parent.reserve(n);
     birthtime.reserve(n);
@@ -377,9 +357,6 @@ index_t UnionFind::link(index_t x, index_t y) {
         parent[y] = x;
         return y;
     } else {
-        // Equal-birth tie-break on the ORIGINAL dense vertex index:
-        // identical to upstream in dense mode; in compact mode the compact
-        // ids must never be compared directly.
         const bool xDies =
             (kept == nullptr) ? (x > y) : (original[x] > original[y]);
         if (xDies) {
@@ -415,8 +392,6 @@ vector<index_t> UnionFind::getBoundaryIndices(const Cube &edge) const {
         break;
     }
     if (kept != nullptr) {
-        // A kept edge has kept endpoints (shared mask), so both compact
-        // ids exist.
         for (int i = 0; i < 2; ++i) {
             const int32_t compact = kept->vertexCompact(boundaryIndices[i]);
             if (compact < 0) {
@@ -459,10 +434,6 @@ UnionFindDual::UnionFindDual(const CubicalGridComplex &_cgc,
         sentinelIdx = static_cast<index_t>(parent.size() - 1);
         return;
     }
-    // Compact (sparse) mode: nodes are the kept top-cells in canonical order
-    // (increasing dense node id), the 4-corner birth computed only for
-    // them, plus the exterior sentinel as the LAST node (original id
-    // m_xy -- larger than every real node id, as in the dense layout).
     const size_t n = kept->keptTopCells.size() + 1;
     parent.reserve(n);
     birthtime.reserve(n);
@@ -479,15 +450,6 @@ UnionFindDual::UnionFindDual(const CubicalGridComplex &_cgc,
     original.push_back(cgc.m_xy);
     sentinelIdx = static_cast<index_t>(parent.size() - 1);
     if (pockets != nullptr) {
-        // One virtual node per pocket, at CONE_BIRTH -- the value the masked
-        // region carries in every complex. It is strictly greater than every
-        // kept top cell's value, so a pocket is elder to all of them (the dual
-        // is swept in decreasing order, so link() lets the SMALLER birthtime
-        // die) and can only die against the sentinel or another pocket, which
-        // is exactly the set of genuine cavity deaths. Original ids sit above
-        // the sentinel's so the equal-birth tie-break in link() -- now reached
-        // only for pocket-vs-pocket -- is deterministic and keeps the
-        // lower-numbered pocket alive.
         for (int32_t p = 1; p <= pockets->numPockets(); ++p) {
             parent.push_back(static_cast<index_t>(parent.size()));
             birthtime.push_back(pocketBirth);
@@ -500,10 +462,7 @@ void UnionFindDual::seedPockets() {
     if (pockets == nullptr) {
         return;
     }
-    // Boundary-touching pockets ARE the exterior. Pre-unioning them with the
-    // sentinel (which is eldest at INFTY and therefore never dies) means they
-    // emit no bar of their own, matching the dense semantics where a void that
-    // reaches the exterior is not a cavity.
+    // Pockets that touch the grid boundary are part of the exterior.
     for (int32_t p = 1; p <= pockets->numPockets(); ++p) {
         if (pockets->touchesBoundary(p)) {
             parent[sentinelIdx + p] = sentinelIdx;
@@ -534,8 +493,6 @@ index_t UnionFindDual::link(index_t x, index_t y) {
         parent[y] = x;
         return y;
     } else {
-        // Equal-birth tie-break on the ORIGINAL dense node index:
-        // identical to upstream in dense mode.
         const bool xDies =
             (kept == nullptr) ? (x < y) : (original[x] < original[y]);
         if (xDies) {
@@ -554,9 +511,6 @@ value_t UnionFindDual::getBirth(const index_t &idx) const {
 
 dim2::Coordinate UnionFindDual::getCoordinates(index_t idx) const {
     if (isPocketNode(idx) || idx == sentinelIdx) {
-        // Virtual: no voxel exists. Reaching here means a censored or exterior
-        // root leaked into a voxel-reporting path -- always a bug, never a
-        // fallback, so fail loudly rather than return a plausible coordinate.
         throw runtime_error(
             "UnionFindDual::getCoordinates on a virtual node (pocket or "
             "exterior sentinel): censored bars must be reported by their "
@@ -598,10 +552,6 @@ vector<index_t> UnionFindDual::getBoundaryIndices(const Cube &edge) const {
         break;
     }
     if (kept != nullptr) {
-        // Sparse: exterior boundary -> compact sentinel (last kept node + 0);
-        // masked top-cells have no compact id and resolve to their pocket's
-        // virtual node at `sentinelIdx + pocket`, which makes the out-of-grid
-        // case and the masked case the same lookup.
         for (int i = 0; i < 2; ++i) {
             if (boundaryIndices[i] == static_cast<index_t>(cgc.m_xy)) {
                 boundaryIndices[i] = sentinelIdx;

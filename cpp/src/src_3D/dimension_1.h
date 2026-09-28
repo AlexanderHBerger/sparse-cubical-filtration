@@ -12,9 +12,6 @@ typedef priority_queue<Cube, vector<Cube>, CubeComparator> CubeQueue;
 
 class Dimension1 {
   public:
-    // kept: Kept-cell index (sparse mode; nullptr in dense mode) -- all
-    // CubeMaps become K-sized compact maps and the edge enumerations
-    // iterate the kept edge list.
     Dimension1(const CubicalGridComplex &cgc0, const CubicalGridComplex &cgc1,
                const CubicalGridComplex &cgcComp, const Config &config,
                vector<Pair> &pairs0, vector<Pair> &pairs1,
@@ -56,8 +53,6 @@ class Dimension1 {
     );
 
     void computeMatching();
-    // Sparse mode: append this complex's cone 2-cell columns to a (sorted)
-    // column list. Every one is born at CONE_BIRTH.
     void appendConeColumns(vector<Cube> &ctr,
                            const CubicalGridComplex &cgc) const;
     void
@@ -114,31 +109,19 @@ class Dimension1 {
     unordered_map<uint64_t, bool> &isMatched0;
     unordered_map<uint64_t, bool> &isMatched1;
     unordered_map<uint64_t, size_t> &isMatchedWithIndexComp;
-    // Kept-cell index (sparse mode only; nullptr in dense mode).
     const KeptCells *kept;
 #ifdef USE_ISPAIRED
     unordered_map<uint64_t, bool> isPairedComp;
 #endif
     SparseOrDenseCubeMap<1, Pair> matchMap0;
     SparseOrDenseCubeMap<1, Pair> matchMap1;
-    // NOTE: the image match maps are keyed by 2-CELL indices (the reduced
-    // column / comp death), so their sparse backing is the kept 2-cell
-    // space; the dense CubeMap<2,...> layout is identical to
-    // CubeMap<1,...> (NUM_TYPES == 3 for both).
     SparseOrDenseCubeMap<2, uint64_t> matchMapIm0;
     SparseOrDenseCubeMap<2, uint64_t> matchMapIm1;
 
-    // Virtual cone cells (nullptr in dense mode).
     const ConeIndex *cone;
-    // Censored dim-1 bars (empty in dense mode).
     vector<Cube> &essentials0;
     vector<Cube> &essentials1;
     vector<pair<size_t, size_t>> &essentialMatches;
-    // Censored dim-1 bars (the death column is a cone 2-cell at
-    // CONE_BIRTH, with no voxel) go to essentials0/1 by BIRTH cell,
-    // joined through these maps keyed by the comparison death cell -- the same
-    // key the finite path uses, and shared across I/J/C because virtual cells
-    // are derived from the shared mask.
     unordered_map<uint64_t, size_t> censoredIndex0;
     unordered_map<uint64_t, size_t> censoredIndex1;
 

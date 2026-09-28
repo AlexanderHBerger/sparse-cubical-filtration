@@ -10,9 +10,6 @@
 namespace dim3 {
 class Dimension2 {
   public:
-    // kept: Kept-cell index (sparse mode; nullptr in dense mode) -- the
-    // three dual union-finds become compact over the kept top-cells and the
-    // dual-edge enumerations iterate the kept 2-cell list.
     Dimension2(const CubicalGridComplex &cgc0, const CubicalGridComplex &cgc1,
                const CubicalGridComplex &cgcComp, const Config &config,
                vector<Pair> &pairs0, vector<Pair> &pairs1,
@@ -56,26 +53,15 @@ class Dimension2 {
     unordered_map<uint64_t, bool> &isMatched0;
     unordered_map<uint64_t, bool> &isMatched1;
     unordered_map<uint64_t, size_t> &isMatchedWithIndexComp;
-    // Essential classes (surviving finite-birth dual roots, excluding the
-    // exterior sentinel and masked nodes), sparse mode only. The stored Cube
-    // is the dual root top-cell -- the only representative a never-merging
-    // dual component has. Censored bars (below) are stored by BIRTH cell.
     vector<Cube> &essentials0;
     vector<Cube> &essentials1;
-    // Essential matches as index pairs into (essentials0, essentials1), keyed
-    // on COMP dual roots.
     vector<pair<size_t, size_t>> &essentialMatches;
-    // Censored bars (dying root is a virtual pocket, so the death is
-    // CONE_BIRTH and there is no death voxel) are recorded in essentials0/1 by
-    // their BIRTH cell and joined through these maps, keyed by the
-    // comparison-side dying root exactly as matchMap0/1 are.
     unordered_map<index_t, size_t> censoredMatchMap0;
     unordered_map<index_t, size_t> censoredMatchMap1;
     unordered_map<index_t, size_t> essentialMatchMap0;
     unordered_map<index_t, size_t> essentialMatchMap1;
     unordered_map<index_t, Pair> matchMap0;
     unordered_map<index_t, Pair> matchMap1;
-    // Kept-cell index (sparse mode only; nullptr in dense mode).
     const KeptCells *kept;
     const PocketNodes *pockets;
     UnionFindDual uf0;

@@ -20,7 +20,6 @@ typedef tuple<index_t, index_t, index_t> Coordinate;
 typedef vector<Coordinate> RepresentativeCycle;
 
 #ifdef RUNTIME
-// Init-phase timing attribution (RUNTIME builds only).
 extern double g_tGrid, g_tKept, g_tPocketVal, g_tPocketTop,
     g_tConeVE, g_tConeFaces, g_tConeInc, g_tConeEmit, g_tConeCycles,
     g_tRangeCheck;
@@ -90,29 +89,13 @@ class CubicalGridComplex {
 
   private:
     void getGridFromVector(const vector<value_t> &vector);
-    // Contiguous padded (shape+2)^3 grid, row-major. getBirth is one
-    // arithmetic load rather than three dependent pointer dereferences, and
-    // construction is a single allocation instead of ~O((s+2)^2) new[] calls.
     vector<value_t> grid;
     size_t gridStrideX;
     size_t gridStrideY;
 };
 
-// Kept-cell reindexing: one O(N) pass over the
-// comparison complex classifies every cell as kept (finite birth) or masked.
-// Masked voxels are INFTY in BOTH inputs (shared mask), so a cell has finite
-// birth in the comparison complex iff it does in input 0 iff in input 1 --
-// this single classification serves all three complexes and both image
-// complexes. Per cell dimension it provides
-//   - a dense int32 compact-id array over the SAME slot space the dense
-//     structures use (vertices: the dim-0 UnionFind vertex ids; edges and
-//     2-cells: the CubeMap (x,y,z,type) slots; 3-cells: the UnionFindDual
-//     node ids), -1 marking masked/absent cells, and
-//   - the kept-cell list in the SAME canonical nested-loop order
-//     (x,y,z[,type]) as the full-grid enumerations, so downstream stable
-//     sorts and processing orders see identical sequences.
-// A kept cell may have a finite birth >= maskThreshold in one input (it is
-// kept because the other input is below threshold there).
+// Cells with finite birth in the comparison complex. Kept lists follow the
+// order of the full-grid enumerations, compact ids index the sparse maps.
 class KeptCells {
   public:
     explicit KeptCells(const CubicalGridComplex &cgcComp);
@@ -130,16 +113,12 @@ class KeptCells {
         return compactTopCell[dualNodeIdx];
     }
 
-    // Kept lists in canonical order: dense vertex ids (x*n_yz + y*n_z + z),
-    // packed cube spatial keys (x<<44 | y<<24 | z<<4 | type), and dual node
-    // ids (x*m_yz + y*m_z + z) respectively.
     vector<index_t> keptVertices;
     vector<uint64_t> keptEdges;
     vector<uint64_t> keptTwoCells;
     vector<index_t> keptTopCells;
 
   private:
-    // Same slot math as CubeMap<1/2,_Tp>::computeCoordinateIndex.
     size_t slotIndex(uint64_t cubeIndex) const {
         const size_t x = (cubeIndex >> 44) & 0xfffff;
         const size_t y = (cubeIndex >> 24) & 0xfffff;
@@ -155,24 +134,14 @@ class KeptCells {
     size_t strideY;
 };
 
-// Sparse mode: the virtual nodes that stand in for the masked region, which
-// enters as one terminal slice at CONE_BIRTH. See src_2D/data_structures.h for
-// the full argument; the 3D version is identical with 8 corners instead of 4.
 class PocketNodes {
   public:
-    // `voxelLabels` MUST outlive this object: the labels are not copied and
-    // ofTopCellAt() reads them on demand. Materialising the cube-label array
-    // instead costs an int32[m_xyz] and an 8N-load
-    // O(N) pass, for a table that is only ever probed O(kept) times -- twice
-    // per kept 2-cell in the dual UF and <=8 per rim cell in ConeIndex.
     PocketNodes(const CubicalGridComplex &cgcComp,
                 const vector<int32_t> &voxelLabels, size_t keptVoxels);
 
     int32_t numPockets() const { return n; }
-    // Pocket of the top cell with min-corner (cx,cy,cz); 0 if kept. The cube
-    // is non-kept iff a corner is masked, and its pocket is the max over the
-    // corner labels -- exact because all masked corners of one cube lie within
-    // L_inf <= 1, hence in one fine pocket.
+    // All masked corners of a top cell lie in the same pocket, so its pocket
+    // is the max over the corner labels (0 if the cell is kept).
     int32_t ofTopCellAt(index_t cx, index_t cy, index_t cz) const {
         if (!cubePocket.empty()) {
             return cubePocket[static_cast<size_t>(cx) * myz +
@@ -192,60 +161,37 @@ class PocketNodes {
         }
         return best;
     }
-    // Flat dual-node-id form. Costs two integer divisions -- prefer
-    // ofTopCellAt on anything hot.
     int32_t ofTopCell(index_t nodeIdx) const {
         return ofTopCellAt(nodeIdx / myz, nodeIdx / mz % my, nodeIdx % mz);
     }
 
-    // True iff the pocket contains a masked voxel on a grid face, i.e. it IS
-    // the exterior and must be pre-unioned with the sentinel.
     bool touchesBoundary(int32_t pocket) const { return boundary[pocket] != 0; }
 
   private:
     const vector<int32_t> *labels = nullptr;
-    // Optional memo of the cube labelling. Materialising it costs 8N label
-    // loads plus an int32[m_xyz]; probing lazily costs 8 loads per probe, and
-    // the probes are O(kept): ~8 per rim vertex, 4 per rim edge, 2 per rim
-    // face, 2 per kept 2-cell in each dual UF -- call it ~26 per kept voxel.
-    // So the memo pays iff 26 * kept > N.
     vector<int32_t> cubePocket;
-    size_t syz = 0;                 // voxel-grid strides for ofTopCellAt
+    size_t syz = 0;
     size_t sz = 0;
-    index_t mx = 0, my = 0, mz = 0; // cube-grid extents for ofTopCell
+    index_t mx = 0, my = 0, mz = 0;
     size_t myz = 0;
     int32_t n = 0;
     vector<uint8_t> boundary;
 };
 
-// Virtual (non-grid) cells of the sparse dim-1 construction, encoded in
-// the unused bits of Cube::index's 4-bit `type` field: the grid uses 0..2, and
-// 3..14 are free. Coordinates stay meaningful -- a virtual cell is anchored at
-// the kept cell it is coned from -- so CubeComparator, the (birth, index)
-// tie-break and every debug print keep working, and virtual cells sort AFTER
-// real ones at the same coordinate, which is what the boundary order needs.
-//
-//   coneEdge(p, v)    type = 3 + rankV      rankV in [0, 8)  -> type 3..10
-//   cone2Cell(p, e)   type = 3 + 4*e.type + rankE   rankE in [0, 4) -> 3..14
-//
-// where rankV/rankE is the position of pocket p in the SORTED list of distinct
-// pockets touching that cell. That keeps the encoding canonical (it is
-// derived from the shared mask, so it is identical in I, J and C) and bounded.
+// Virtual cells use the unused values 3..14 of the 4-bit type field and are
+// anchored at the kept cell they are coned from:
+//   coneEdge(p, v):  type = 3 + rank
+//   cone2Cell(p, e): type = 3 + 4 * e.type + rank
+// where rank is the position of pocket p among the sorted pockets touching
+// the anchor. At equal coordinates they sort after the real cells.
 constexpr uint8_t VIRTUAL_TYPE_BASE = 3;
 inline bool isVirtualCell(uint64_t index) {
     return (index & 0xf) >= VIRTUAL_TYPE_BASE;
 }
 
-// Sparse dim-1 incidence: which pockets each kept vertex / edge is a rim
-// cell of. A kept cell is a rim cell of p iff some non-kept CUBE of p has
-// it as a face -- note this is the CUBE stencil, not the smaller stencil of
-// masked cofacet 2-cells: a cube can be non-kept because a corner diagonally
-// opposite the edge is masked while both of its 2-cells containing that edge
-// are kept.
-//
-// The chain complex closes because an edge's cube stencil is contained in each
-// endpoint's, so every vertex of a rim edge of p is a rim vertex of p:
-//     d(cone2Cell(p, e)) = e + coneEdge(p, v0) + coneEdge(p, v1).
+// Cone over the rim of every pocket (dimension 1 in 3D). A kept vertex or edge
+// is on the rim of pocket p if it is a face of a non-kept cube of p. Every
+// (rim vertex, p) gets a cone edge and every (rim edge, p) a cone 2-cell.
 class ConeIndex {
   public:
     ConeIndex(const CubicalGridComplex &cgcComp, const KeptCells &kept,
@@ -254,7 +200,6 @@ class ConeIndex {
     size_t numConeEdges() const { return vPocket.size(); }
     size_t numCone2Cells() const { return ePocket.size(); }
 
-    // Compact row/column ids, laid out after the kept cells of that dimension.
     int32_t coneEdgeSlot(int32_t keptVertex, uint8_t rank) const {
         return vStart[keptVertex] + rank;
     }
@@ -273,8 +218,6 @@ class ConeIndex {
     int32_t cone2CellPocket(int32_t keptEdge, uint8_t rank) const {
         return ePocket[eStart[keptEdge] + rank];
     }
-    // Precomputed ranks of the same pocket at the edge's two endpoints, so
-    // enumerating a cone 2-cell's boundary is O(1) with no search.
     uint8_t rankAtV0(int32_t keptEdge, uint8_t rank) const {
         return eRankV0[eStart[keptEdge] + rank];
     }
@@ -282,45 +225,18 @@ class ConeIndex {
         return eRankV1[eStart[keptEdge] + rank];
     }
 
-    // --- pruning (config.conePrune) --------------------------------------
-    // Emit cone2Cell for a slot iff its bit is set. Slot NUMBERING is
-    // unchanged by pruning -- suppressed columns leave GAPS -- so every
-    // pivotColumnIndex / SparseOrDenseCubeMap sizing and every
-    // cone2CellSlot() stays valid, and the (birth, index) tie-break inside
-    // the virtual slice is not reshuffled. Compacting the slots instead would
-    // renumber every surviving column's Cube index and change which cells
-    // are reported as deaths inside the virtual slice, so it is deliberately
-    // not done.
     bool emitCone2Cell(int32_t slot) const {
         return (emitBits[static_cast<size_t>(slot) >> 6] >>
                 (static_cast<size_t>(slot) & 63)) &
                1ULL;
     }
     size_t numEmittedCone2Cells() const { return nEmitted; }
-    // Rim 2-cells, as (kept 2-cell, pocket) pairs. Only pruning needs these.
     size_t numRimFaces() const { return fPocket.size(); }
 
-    // --- explicit fundamental cycles --------------------------------------
-    // The emitted cone block is a spanning FOREST of the rim graph (whose
-    // vertices are cone edges and whose edges are cone 2-cells, one connected
-    // piece per pocket) plus b_1 non-tree columns. Reducing it by Gaussian
-    // elimination just recomputes that forest: a tree column claims a cone
-    // edge at CONE_BIRTH, which is its own birth, so it emits NOTHING, and a
-    // non-tree column only becomes useful once its two cone edges have cancelled
-    // against the tree columns along the path between its endpoints.
-    //
-    // So the forest is built here instead, with a union-find over the emitted
-    // slots in SLOT order -- which is exactly the (birth, index) order the
-    // reduction sees, because slot order is (x, y, z, edge type, rank) and a
-    // cone 2-cell's Cube index is (x, y, z, 3 + 4*type + rank). Every non-tree
-    // column's endpoints are therefore already joined by STRICTLY EARLIER tree
-    // columns, so its fundamental cycle is a combination of earlier columns --
-    // which is what makes the substitution rank-preserving, hence pairing- and
-    // output-identical.
-    //
-    // What is emitted is then one column per non-tree slot, carrying the
-    // explicit cycle `e + path_T(u, v)` over REAL kept edges only. No cone
-    // edge and no tree column is ever built.
+    // With pruning, the cone block is a spanning forest of the rim graph plus
+    // one column per non-tree slot. Tree columns pair with a cone edge at
+    // their own birth and produce no bar, so only the non-tree columns are
+    // emitted, each as its fundamental cycle e + path(u, v) over kept edges.
     bool hasCycles() const { return !cycPtr.empty(); }
     bool emitCycleColumn(int32_t slot) const {
         return cycIndex[static_cast<size_t>(slot)] >= 0;
@@ -329,10 +245,6 @@ class ConeIndex {
         const int32_t c = cycIndex[static_cast<size_t>(slot)];
         return cycPtr[c + 1] - cycPtr[c];
     }
-    // Faces in DECREASING Cube-index order, which is what hasPreviousFace and
-    // the emergent-pair lemma need: the faces are all real kept edges, and the
-    // maximal one under (birth, index) among those at the column's birth is
-    // the first one reached scanning indices downwards.
     uint64_t cycleEdge(int32_t slot, int32_t k) const {
         return cycEdge[static_cast<size_t>(
                            cycPtr[cycIndex[static_cast<size_t>(slot)]]) +
@@ -347,15 +259,13 @@ class ConeIndex {
     vector<int32_t> vStart, vPocket;
     vector<int32_t> eStart, ePocket;
     vector<uint8_t> eRankV0, eRankV1;
-    // Rim faces in the same CSR shape, plus rim-EDGE slot -> rim-FACE slots.
     vector<int32_t> fStart, fPocket;
     vector<int32_t> efStart, efFace;
     vector<uint64_t> emitBits;
     size_t nEmitted = 0;
-    // cone2Cell slot -> index into cycPtr, or -1 (tree column / not emitted).
     vector<int32_t> cycIndex;
     vector<int32_t> cycPtr;
-    vector<uint64_t> cycEdge;   // packed kept-edge keys, DESCENDING per cycle
+    vector<uint64_t> cycEdge;
 
     void buildFaces(const CubicalGridComplex &cgcComp, const KeptCells &kept,
                     const PocketNodes &pockets);
@@ -368,10 +278,6 @@ class ConeIndex {
 
 class UnionFind {
   public:
-    // kept == nullptr: dense over all vertices (bit-identical to upstream).
-    // kept != nullptr (sparse mode): compact over the kept vertices
-    // only; node ids are compact ids, and equal-birth tie-breaks compare the
-    // stored ORIGINAL dense vertex indices (never compact ids).
     UnionFind(const CubicalGridComplex &cgc, const KeptCells *kept = nullptr);
     index_t find(index_t x);
     index_t link(index_t x, index_t y);
@@ -384,38 +290,24 @@ class UnionFind {
   private:
     vector<index_t> parent;
     vector<value_t> birthtime;
-    // Compact (sparse) mode only: compact id -> original dense vertex id
-    // (strictly increasing; empty in dense mode).
     vector<index_t> original;
     const CubicalGridComplex &cgc;
     const KeptCells *kept;
 };
 
+// In sparse mode the nodes are laid out as
+//   [kept top cells 0..K-1] [exterior sentinel K] [pockets K+1..K+P].
 class UnionFindDual {
   public:
-    // kept == nullptr: dense over all top-cells + exterior sentinel
-    // (bit-identical to upstream). kept != nullptr (sparse mode):
-    // compact over the kept top-cells, the exterior sentinel as the LAST
-    // node (compact id size()-1, original id m_xyz); equal-birth tie-breaks
-    // compare original dense node ids.
-    // Sparse mode adds one node per pocket AFTER the exterior sentinel, all
-    // born at `pocketBirth` (= CONE_BIRTH). Node layout is then
-    //     [kept top cells 0 .. K-1] [exterior sentinel K] [pockets K+1 .. K+P]
-    // so `K + pocketId` addresses a pocket and `K + 0` the sentinel, making
-    // the out-of-grid and masked cases one uniform lookup.
     UnionFindDual(const CubicalGridComplex &cgc,
                   const KeptCells *kept = nullptr,
                   const PocketNodes *pockets = nullptr,
                   value_t pocketBirth = INFTY);
-    // A virtual pocket node has no voxel: a bar whose dying root is one is
-    // CENSORED (death = CONE_BIRTH) and must be reported by its birth cell
-    // only.
     bool isPocketNode(index_t idx) const {
         return pockets != nullptr && idx > sentinelIdx;
     }
     index_t sentinel() const { return sentinelIdx; }
-    // Pre-union every boundary-touching pocket into the sentinel. Must run
-    // after each reset(), before the sweep.
+    // Has to be called again after every reset().
     void seedPockets();
     index_t find(index_t x);
     index_t link(index_t x, index_t y);
@@ -428,7 +320,6 @@ class UnionFindDual {
   private:
     vector<index_t> parent;
     vector<value_t> birthtime;
-    // Compact (sparse) mode only: compact id -> original dense dual node id.
     vector<index_t> original;
     const CubicalGridComplex &cgc;
     const KeptCells *kept;
@@ -508,22 +399,11 @@ template <int _dim, class _Tp> void CubeMap<_dim, _Tp>::clear() {
     elements.resize(shape[0] * shape[1] * shape[2] * NUM_TYPES);
 }
 
-// CubeMap facade. Constructed without a kept index it contains a real
-// dense CubeMap (bit-identical to upstream); constructed with one (sparse
-// mode) it stores a K-sized compact payload indexed through the kept-cell
-// compact ids. `find` on a cell without a compact id returns none; writing
-// such a cell is an sparse invariant violation and throws. _dim selects which
-// kept list backs the payload and must match the KEY space of the map
-// (edge-keyed maps: 1, 2-cell-keyed maps: 2) -- for the dense CubeMap the
-// two layouts are identical anyway (NUM_TYPES == 3 for both).
 template <int _dim, class _Tp> class SparseOrDenseCubeMap {
     static_assert(_dim == 1 || _dim == 2,
                   "SparseOrDenseCubeMap backs edge- or 2-cell-keyed maps");
 
   public:
-    // `cone`: sparse mode only. Virtual cells (cone edges for _dim == 1, cone
-    // 2-cells for _dim == 2) get compact ids in a range laid out AFTER the kept
-    // cells of that dimension, so the same flat vector backs both.
     SparseOrDenseCubeMap(vector<index_t> shape,
                          const KeptCells *kept = nullptr,
                          const ConeIndex *cone = nullptr)
@@ -586,8 +466,6 @@ template <int _dim, class _Tp> class SparseOrDenseCubeMap {
     }
     int32_t compactIndex(uint64_t cube_index) const {
         if (cone != nullptr && isVirtualCell(cube_index)) {
-            // A virtual key's anchor is the kept cell it is coned from: a cone
-            // edge is anchored at a kept VERTEX, a cone 2-cell at a kept EDGE.
             const index_t x = (cube_index >> 44) & 0xfffff;
             const index_t y = (cube_index >> 24) & 0xfffff;
             const index_t z = (cube_index >> 4) & 0xfffff;
@@ -648,8 +526,6 @@ template <int _dim, class _Tp> class SparseOrDenseCubeMap {
     std::optional<_Tp> none = {};
 
   public:
-    // The dense vertex id space (x*n_yz + y*n_z + z) is needed to resolve a
-    // cone edge's anchor vertex; it is set once from the complex's shape.
     void setVertexStrides(size_t strideX, size_t strideY) {
         vertexStrideX = strideX;
         vertexStrideY = strideY;

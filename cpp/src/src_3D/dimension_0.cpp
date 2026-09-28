@@ -106,32 +106,15 @@ void Dimension0::computePairs(vector<Cube> &edges, uint8_t k) {
         }
     }
 
-    // Sparse: surviving finite-birth roots are essential classes (foreground
-    // islands); emit their birth vertices. Masked vertices (birth INFTY) are
-    // inert isolated roots and are skipped.
     if (config.sparseComplex) {
         vector<Cube> &essentials = (k == 0) ? essentials0 : essentials1;
-        // The sparse UF is compact -- scan its (kept) nodes; visit order
-        // (increasing compact id == increasing dense vertex id) matches a
-        // full-vertex scan restricted to kept vertices.
         const index_t numVertices = uf.size();
         unordered_map<index_t, size_t> &essentialMatchMap =
             (k == 0) ? essentialMatchMap0 : essentialMatchMap1;
         for (index_t v = 0; v < numVertices; ++v) {
             if (uf.find(v) == v) {
                 value_t rootBirth = uf.getBirth(v);
-                // A root at or above tau is a kept component every
-                // voxel of which this input puts above threshold -- kept only
-                // because the OTHER input is below it, i.e. a structure this
-                // input misses entirely. It is surfaced and matchable like any
-                // other: its bar is (rootBirth, CONE_BIRTH), and dropping it
-                // would leave the other side's essential unmatched with no
-                // loss term to act on it.
                 if (rootBirth != INFTY) {
-                    // Injection: gate-passing roots become matchable
-                    // through the essential pass (key = input-UF root; final
-                    // roots are order-independent, so the image-pass uf0/uf1
-                    // land on the same vertex).
                     if (rootBirth < TAU_REAL) {
                         essentialMatchMap.emplace(v, essentials.size());
                     }
@@ -206,13 +189,7 @@ void Dimension0::computeImagePairsAndMatch(vector<Cube> &edges) {
         }
     }
 
-    // The single essential pass. C-components that never merge have no death
-    // event, so the merge-driven loop above never visits them; match their
-    // injected input essentials through the three roots: r0/r1 are the
-    // input-side roots of the surviving ufComp component, gated by TAU_REAL
-    // on both sides.
     if (config.sparseComplex) {
-        // Compact node scan (see computePairs).
         const index_t numVertices = ufComp.size();
         for (index_t v = 0; v < numVertices; ++v) {
             if (ufComp.find(v) != v || ufComp.getBirth(v) == INFTY) {

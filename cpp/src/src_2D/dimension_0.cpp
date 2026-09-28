@@ -84,26 +84,15 @@ void Dimension0::computePairs(vector<Cube> &edges, uint8_t k) {
         }
     }
 
-    // Sparse: surviving finite-birth roots are essential classes (foreground
-    // islands); emit their birth vertices. Masked vertices (birth INFTY) are
-    // inert isolated roots and are skipped.
     if (config.sparseComplex) {
         vector<Cube> &essentials = (k == 0) ? essentials0 : essentials1;
-        // The sparse UF is compact -- scan its (kept) nodes; visit order
-        // (increasing compact id == increasing dense vertex id) matches a
-        // full-vertex scan restricted to kept vertices.
         const index_t numVertices = uf.size();
         unordered_map<index_t, size_t> &essentialMatchMap =
             (k == 0) ? essentialMatchMap0 : essentialMatchMap1;
         for (index_t v = 0; v < numVertices; ++v) {
             if (uf.find(v) == v) {
                 value_t rootBirth = uf.getBirth(v);
-                // A root at or above tau is a kept component this
-                // input misses entirely (kept only because the OTHER input is
-                // below threshold). Surfaced and matchable like any other --
-                // see src_3D/dimension_0.cpp.
                 if (rootBirth != INFTY) {
-                    // Injection (see src_3D/dimension_0.cpp).
                     if (rootBirth < TAU_REAL) {
                         essentialMatchMap.emplace(v, essentials.size());
                     }
@@ -172,9 +161,7 @@ void Dimension0::computeImagePairsAndMatch(vector<Cube> &edges) {
         }
     }
 
-    // Essential pass (see src_3D/dimension_0.cpp).
     if (config.sparseComplex) {
-        // Compact node scan (see computePairs).
         const index_t numVertices = ufComp.size();
         for (index_t v = 0; v < numVertices; ++v) {
             if (ufComp.find(v) != v || ufComp.getBirth(v) == INFTY) {

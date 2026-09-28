@@ -30,8 +30,6 @@ BettiMatching::BettiMatching(vector<value_t> &&input0, vector<value_t> &&input1,
     }
 
     vector<value_t> comparison;
-    // Reserve up front: back_inserter would otherwise grow geometrically,
-    // reallocating and re-copying an O(N) buffer several times.
     comparison.reserve(input0.size());
     transform(input0.begin(), input0.end(), input1.begin(),
               back_inserter(comparison),
@@ -272,7 +270,6 @@ BettiMatching::getUnmatchedEssentialBirthVoxels() {
                 bettiMatching.unmatchedEssentials1};
     }
     default:
-        // 1D / nD never run sparse (rejected in the constructor).
         return {vector<vector<vector<index_t>>>(dimension),
                 vector<vector<vector<index_t>>>(dimension)};
     }
